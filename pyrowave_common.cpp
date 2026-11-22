@@ -255,6 +255,34 @@ bool WaveletBuffers::init(Device *device_, int width_, int height_, ChromaSubsam
 	aligned_width = std::max<int>(aligned_width, MinimumImageSize);
 	aligned_height = std::max<int>(aligned_height, MinimumImageSize);
 
+	auto vendor_id = device->get_gpu_properties().vendorID;
+	bool ssbo_friendly_vendor =
+		vendor_id == VENDOR_ID_AMD || vendor_id == VENDOR_ID_INTEL || vendor_id == VENDOR_ID_NVIDIA;
+
+	if (!device->get_device_features().vk12_features.storageBuffer8BitAccess)
+	{
+		if (ssbo_friendly_vendor)
+		{
+			use_ssbo32_payload = true;
+		}
+		else if (device->get_gpu_properties().limits.maxTexelBufferElements >= 16 * 1024 * 1024)
+		{
+			use_readonly_texel_buffer = true;
+		}
+	}
+	else if (!ssbo_friendly_vendor &&
+	         device->get_device_features().driver_id != VK_DRIVER_ID_SAMSUNG_PROPRIETARY &&
+	         device->get_gpu_properties().limits.maxTexelBufferElements >= 16 * 1024 * 1024)
+	{
+		// If the GPU is sufficiently competent with texel buffers, prefer texel/linear-image fallback on mobile IHVs.
+		use_readonly_texel_buffer = true;
+	}
+
+	if (use_ssbo32_payload)
+		LOGI("Using 32-bit SSBO instead of 8-bit SSBO.\n");
+	else if (use_readonly_texel_buffer)
+		LOGI("Using texel buffers instead of SSBO.\n");
+
 	init_samplers();
 	allocate_images();
 	if (fragment_path)
@@ -263,21 +291,6 @@ bool WaveletBuffers::init(Device *device_, int width_, int height_, ChromaSubsam
 	init_block_meta();
 
 	Vulkan::ResourceLayout layout;
-
-	// If the GPU is sufficiently competent with texel buffers, we can use that as a fallback to 8-bit storage.
-	if (device->get_gpu_properties().limits.maxTexelBufferElements >= 16 * 1024 * 1024)
-	{
-		auto vendor_id = device->get_gpu_properties().vendorID;
-		if (!device->get_device_features().vk12_features.storageBuffer8BitAccess ||
-		    (vendor_id != VENDOR_ID_AMD && vendor_id != VENDOR_ID_INTEL && vendor_id != VENDOR_ID_NVIDIA &&
-		     device->get_device_features().driver_id != VK_DRIVER_ID_SAMSUNG_PROPRIETARY))
-		{
-			use_readonly_texel_buffer = true;
-		}
-	}
-
-	if (use_readonly_texel_buffer)
-		LOGI("Using texel buffers instead of SSBO.\n");
 
 	shaders = Shaders<>(*device, layout, [this](const char *, const char *env) {
 		if (strcmp(env, "FP16") == 0)

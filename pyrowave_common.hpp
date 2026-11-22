@@ -205,6 +205,7 @@ struct WaveletBuffers
 	int aligned_height = 0;
 
 	bool use_readonly_texel_buffer = false;
+	bool use_ssbo32_payload = false;
 	bool fragment_path = false;
 
 protected:

@@ -21,10 +21,40 @@ struct DequantizerPushData
 	int32_t block_stride_32x32;
 };
 
+static bool supports_uma_upload(const Device &dev)
+{
+	const auto &mem_props = dev.get_memory_properties();
+	constexpr VkMemoryPropertyFlags required_flags =
+		VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+		VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	constexpr VkDeviceSize min_uma_heap_size = 512ull * 1024ull * 1024ull;
+
+	for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++)
+	{
+		const auto &type = mem_props.memoryTypes[i];
+		if ((type.propertyFlags & required_flags) == required_flags &&
+		    type.heapIndex < mem_props.memoryHeapCount &&
+		    mem_props.memoryHeaps[type.heapIndex].size >= min_uma_heap_size)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
 struct Decoder::Impl final : public WaveletBuffers
 {
+	static constexpr uint32_t kUmaRingSlots = 4;
+
 	BufferHandle dequant_offset_buffer, payload_data;
 	BufferViewHandle payload_u32_view, payload_u16_view, payload_u8_view;
+
+	// Ring-buffered zero-copy UMA upload buffers (used when !use_readonly_texel_buffer and UMA heap is present).
+	bool use_uma_upload = false;
+	uint32_t uma_slot = 0;
+	BufferHandle uma_dequant_offset[kUmaRingSlots];
+	BufferHandle uma_payload_data[kUmaRingSlots];
 
 	// Turbo-hacky path.
 	DeviceAllocationOwnerHandle linear_memory;
@@ -54,6 +84,7 @@ struct Decoder::Impl final : public WaveletBuffers
 	void clear();
 
 	void upload_payload(CommandBuffer &cmd);
+	bool upload_payload_uma();
 
 	void check_linear_texture_support();
 };
@@ -124,6 +155,53 @@ void Decoder::Impl::upload_payload(CommandBuffer &cmd)
 
 	if (!payload_data_cpu.empty())
 		memcpy(cmd.update_buffer(*payload_data, 0, required_size), payload_data_cpu.data(), required_size);
+}
+
+bool Decoder::Impl::upload_payload_uma()
+{
+	VkDeviceSize required_size = payload_data_cpu.size() * sizeof(uint32_t);
+
+	// Avoid edge case OOB access without robustness on the payload buffer during dequant.
+	VkDeviceSize required_size_padded = required_size + 16;
+
+	auto &payload_buf = uma_payload_data[uma_slot];
+	if (!payload_buf || required_size_padded > payload_buf->get_create_info().size)
+	{
+		BufferCreateInfo bufinfo;
+		bufinfo.size = std::max<VkDeviceSize>(64 * 1024, required_size_padded * 2);
+		bufinfo.usage =
+			VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+			VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT;
+		bufinfo.domain = BufferDomain::LinkedDeviceHost;
+		payload_buf = device->create_buffer(bufinfo);
+		if (!payload_buf)
+			return false;
+		device->set_name(*payload_buf, "payload-data-uma");
+	}
+
+	auto *payload_dst = static_cast<uint8_t *>(device->map_host_buffer(*payload_buf, MEMORY_ACCESS_WRITE_BIT));
+	if (!payload_dst)
+		return false;
+	if (required_size > 0)
+		memcpy(payload_dst, payload_data_cpu.data(), required_size);
+	memset(payload_dst + required_size, 0, 16);
+	device->unmap_host_buffer(*payload_buf, MEMORY_ACCESS_WRITE_BIT);
+
+	auto &offset_buf = uma_dequant_offset[uma_slot];
+	if (!offset_buf)
+		return false;
+
+	VkDeviceSize offset_size = dequant_offset_buffer_cpu.size() * sizeof(dequant_offset_buffer_cpu.front());
+	if (offset_size > 0)
+	{
+		auto *offset_dst = static_cast<uint8_t *>(device->map_host_buffer(*offset_buf, MEMORY_ACCESS_WRITE_BIT));
+		if (!offset_dst)
+			return false;
+		memcpy(offset_dst, dequant_offset_buffer_cpu.data(), offset_size);
+		device->unmap_host_buffer(*offset_buf, MEMORY_ACCESS_WRITE_BIT);
+	}
+
+	return true;
 }
 
 bool Decoder::Impl::decode_packet(const BitstreamHeader *header)
@@ -268,13 +346,32 @@ void Decoder::Impl::init_block_meta()
 {
 	WaveletBuffers::init_block_meta();
 
-	BufferCreateInfo info;
-	info.domain = BufferDomain::Device;
-	info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	// Enable UMA zero-copy ring-buffered uploads only on SSBO paths (STORAGE_MODE 0 or 3)
+	// so we never alias host-visible memory with linear 2D payload images.
+	use_uma_upload = !use_readonly_texel_buffer && supports_uma_upload(*device);
 
+	BufferCreateInfo info;
 	info.size = block_count_32x32 * sizeof(uint32_t);
-	dequant_offset_buffer = device->create_buffer(info);
-	device->set_name(*dequant_offset_buffer, "meta-buffer");
+	if (use_uma_upload)
+	{
+		info.domain = BufferDomain::LinkedDeviceHost;
+		info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+		for (uint32_t i = 0; i < kUmaRingSlots; i++)
+		{
+			uma_dequant_offset[i] = device->create_buffer(info);
+			if (uma_dequant_offset[i])
+				device->set_name(*uma_dequant_offset[i], "meta-buffer-uma");
+		}
+		LOGI("Using UMA zero-copy ring-buffered uploads.\n");
+	}
+	else
+	{
+		info.domain = BufferDomain::Device;
+		info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		dequant_offset_buffer = device->create_buffer(info);
+		device->set_name(*dequant_offset_buffer, "meta-buffer");
+	}
+
 	dequant_offset_buffer_cpu.resize(block_count_32x32);
 
 	payload_data_cpu.reserve(1024 * 1024);
@@ -301,10 +398,19 @@ bool Decoder::Impl::dequant(CommandBuffer &cmd)
 		return false;
 	}
 
+	const Buffer *active_dequant_offset = use_uma_upload ? uma_dequant_offset[uma_slot].get() : dequant_offset_buffer.get();
+	const Buffer *active_payload_data = use_uma_upload ? uma_payload_data[uma_slot].get() : payload_data.get();
+	if (!active_dequant_offset)
+		return false;
+	if (!payload_r8_image && !use_readonly_texel_buffer && !active_payload_data)
+		return false;
+
 	if (payload_r8_image && payload_r16_image && payload_r32_image)
 		cmd.set_program(shaders.wavelet_dequant[2]);
 	else if (use_readonly_texel_buffer)
 		cmd.set_program(shaders.wavelet_dequant[1]);
+	else if (use_ssbo32_payload)
+		cmd.set_program(shaders.wavelet_dequant[3]);
 	else
 		cmd.set_program(shaders.wavelet_dequant[0]);
 
@@ -347,7 +453,7 @@ bool Decoder::Impl::dequant(CommandBuffer &cmd)
 				cmd.push_constants(&push, 0, sizeof(push));
 
 				cmd.set_storage_texture(0, 0, *component_layer_views[component][level]);
-				cmd.set_storage_buffer(0, 1, *dequant_offset_buffer);
+				cmd.set_storage_buffer(0, 1, *active_dequant_offset);
 
 				if (payload_r8_image && payload_r16_image && payload_r32_image)
 				{
@@ -362,7 +468,7 @@ bool Decoder::Impl::dequant(CommandBuffer &cmd)
 					cmd.set_buffer_view(0, 4, *payload_u8_view);
 				}
 				else
-					cmd.set_storage_buffer(0, 2, *payload_data);
+					cmd.set_storage_buffer(0, 2, *active_payload_data);
 
 				cmd.dispatch((push.resolution.x + 31) / 32, (push.resolution.y + 31) / 32, 1);
 			}
@@ -701,7 +807,15 @@ bool Decoder::Impl::idwt_fragment(CommandBuffer &cmd, const ViewBuffers &views)
 
 bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 {
-	cmd.set_program(shaders.idwt[Configuration::get().get_precision()]);
+	int idwt_variant = Configuration::get().get_precision();
+	if (idwt_variant == 1 &&
+	    !device->get_device_features().vk12_features.shaderFloat16 &&
+	    device->get_gpu_properties().limits.maxComputeSharedMemorySize >= 32768)
+	{
+		// Avoid packHalf2x16/unpackHalf2x16 shared-memory emulation when FP32 shared memory fits easily.
+		idwt_variant = 2;
+	}
+	cmd.set_program(shaders.idwt[idwt_variant]);
 	cmd.enable_subgroup_size_control(false);
 
 	auto start_idwt = cmd.write_timestamp(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
@@ -872,24 +986,34 @@ bool Decoder::Impl::decode_is_ready(bool allow_partial_frame) const
 
 bool Decoder::Impl::decode(CommandBuffer &cmd, const ViewBuffers &views)
 {
-	cmd.begin_region("Decode uploads");
+	if (use_uma_upload)
 	{
-		upload_payload(cmd);
-
-		memcpy(cmd.update_buffer(*dequant_offset_buffer, 0,
-		                         dequant_offset_buffer_cpu.size() * sizeof(dequant_offset_buffer_cpu.front())),
-		       dequant_offset_buffer_cpu.data(), dequant_offset_buffer_cpu.size() * sizeof(dequant_offset_buffer_cpu.front()));
-
-		cmd.barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-		            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-		            use_readonly_texel_buffer ? VK_ACCESS_2_SHADER_SAMPLED_READ_BIT : VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+		uma_slot = (uma_slot + 1) % kUmaRingSlots;
+		if (!upload_payload_uma())
+			return false;
 	}
-	cmd.end_region();
+	else
+	{
+		cmd.begin_region("Decode uploads");
+		{
+			upload_payload(cmd);
+
+			memcpy(cmd.update_buffer(*dequant_offset_buffer, 0,
+			                         dequant_offset_buffer_cpu.size() * sizeof(dequant_offset_buffer_cpu.front())),
+			       dequant_offset_buffer_cpu.data(), dequant_offset_buffer_cpu.size() * sizeof(dequant_offset_buffer_cpu.front()));
+
+			cmd.barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+			            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+			            use_readonly_texel_buffer ? VK_ACCESS_2_SHADER_SAMPLED_READ_BIT : VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+		}
+		cmd.end_region();
+	}
 
 	if (!dequant(cmd))
 		return false;
 
-	cmd.barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+	if (!use_uma_upload)
+		cmd.barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
 
 	if (fragment_path)
 	{
@@ -1029,7 +1153,8 @@ bool Decoder::init(Vulkan::Device *device, int width, int height, ChromaSubsampl
 	}
 
 	if (!device->get_device_features().vk12_features.storageBuffer8BitAccess &&
-	    !impl->use_readonly_texel_buffer)
+	    !impl->use_readonly_texel_buffer &&
+	    !impl->use_ssbo32_payload)
 	{
 		LOGE("Device doesn't support 8-bit storage or large texel buffers.\n");
 		return false;
