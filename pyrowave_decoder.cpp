@@ -807,15 +807,7 @@ bool Decoder::Impl::idwt_fragment(CommandBuffer &cmd, const ViewBuffers &views)
 
 bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 {
-	int idwt_variant = Configuration::get().get_precision();
-	if (idwt_variant == 1 &&
-	    !device->get_device_features().vk12_features.shaderFloat16 &&
-	    device->get_gpu_properties().limits.maxComputeSharedMemorySize >= 32768)
-	{
-		// Avoid packHalf2x16/unpackHalf2x16 shared-memory emulation when FP32 shared memory fits easily.
-		idwt_variant = 2;
-	}
-	cmd.set_program(shaders.idwt[idwt_variant]);
+	cmd.set_program(shaders.idwt[Configuration::get().get_precision()]);
 	cmd.enable_subgroup_size_control(false);
 
 	auto start_idwt = cmd.write_timestamp(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
