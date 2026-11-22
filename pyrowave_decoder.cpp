@@ -70,19 +70,25 @@ struct Decoder::Impl final : public WaveletBuffers
 	uint8_t active_band_mask[NumComponents][DecompositionLevels] = {};
 	struct IdwtWgSplit
 	{
-		uint32_t bucket_offset[8] = {};
-		uint32_t bucket_count[8] = {};
+		uint32_t ll_offset = 0;
+		uint32_t ll_count = 0;
+		uint32_t all_offset = 0;
+		uint32_t all_count = 0;
 		uint32_t mix_offset = 0;
 		uint32_t mix_count = 0;
+		uint32_t edge_offset = 0;
+		uint32_t edge_count = 0;
 		bool use_list = false;
-		bool uniform_direct = false;
-		uint8_t uniform_mask = 0;
 	};
 	IdwtWgSplit idwt_wg_splits[NumComponents][DecompositionLevels] = {};
 	std::vector<uint32_t> wg_list_cpu;
-	std::vector<uint32_t> wg_bucket_scratch[8];
+	std::vector<uint32_t> wg_ll_scratch;
+	std::vector<uint32_t> wg_all_scratch;
 	std::vector<uint32_t> wg_mix_scratch;
 	std::vector<uint8_t> block_hf_scratch;
+	bool prewarmed_idwt_intermediate = false;
+	bool prewarmed_idwt_final = false;
+	float prewarmed_range_scale = 0.0f;
 	int decoded_blocks = 0;
 	int total_blocks_in_sequence = 0;
 	uint32_t last_seq = UINT32_MAX;
@@ -269,8 +275,8 @@ void Decoder::Impl::build_idwt_wg_lists()
 			continue;
 
 		const int interior_wgs = (ix_end - 1) * (iy_end - 1);
-		// Only worthwhile when there are enough interior WGs to amortize indirect lookup.
-		if (interior_wgs < 256)
+		// Only split large levels (L0 and L1 on 1080p/4K); small levels like L2 run faster as one direct dispatch.
+		if (interior_wgs < 1024)
 			continue;
 
 		for (int c = 0; c < NumComponents; c++)
@@ -278,95 +284,122 @@ void Decoder::Impl::build_idwt_wg_lists()
 			if (level == 0 && c != 0 && chroma == ChromaSubsampling::Chroma420)
 				continue;
 
+			auto &split = idwt_wg_splits[c][level];
+			split.use_list = true;
+
 			const uint8_t hf_mask = (active_band_mask[c][level] >> 1) & 0x7u;
 			if (hf_mask == 0)
-				continue;
-
-			const auto &meta = block_meta[c][level][1];
-			const int bx_cnt = meta.block_stride_32x32;
-			const int blk_cnt = meta.block_count_32x32;
-			const int base1 = meta.block_offset_32x32;
-			const int base2 = base1 + blk_cnt;
-			const int base3 = base2 + blk_cnt;
-			const uint32_t *offs = dequant_offset_buffer_cpu.data();
-
-			block_hf_scratch.resize(blk_cnt);
-			for (int i = 0; i < blk_cnt; i++)
 			{
-				uint8_t m = 0;
-				if ((hf_mask & 1u) && offs[base1 + i] != UINT32_MAX) m |= 1u;
-				if ((hf_mask & 2u) && offs[base2 + i] != UINT32_MAX) m |= 2u;
-				if ((hf_mask & 4u) && offs[base3 + i] != UINT32_MAX) m |= 4u;
-				block_hf_scratch[i] = m;
-			}
-
-			for (int b = 0; b < 8; b++)
-				wg_bucket_scratch[b].clear();
-			wg_mix_scratch.clear();
-
-			for (int gy = 1; gy < iy_end; gy++)
-			{
-				const int bx0 = (gy * 16 - 2) >> 5;
-				const int bx1 = (gy * 16 + 17) >> 5;
+				split.ll_offset = uint32_t(wg_list_cpu.size());
+				wg_list_cpu.resize(wg_list_cpu.size() + size_t(interior_wgs));
+				uint32_t *dst = wg_list_cpu.data() + split.ll_offset;
 				for (int gx = 1; gx < ix_end; gx++)
 				{
-					const int by0 = (gx * 16 - 2) >> 5;
-					const int by1 = (gx * 16 + 17) >> 5;
-					const uint8_t m00 = block_hf_scratch[by0 * bx_cnt + bx0];
-					const uint8_t m01 = block_hf_scratch[by0 * bx_cnt + bx1];
-					const uint8_t m10 = block_hf_scratch[by1 * bx_cnt + bx0];
-					const uint8_t m11 = block_hf_scratch[by1 * bx_cnt + bx1];
-					const uint8_t any_m = m00 | m01 | m10 | m11;
-					const uint8_t all_m = m00 & m01 & m10 & m11;
-					const uint32_t packed = uint32_t(gx) | (uint32_t(gy) << 16);
-					if (any_m == all_m)
-						wg_bucket_scratch[any_m].push_back(packed);
-					else
-						wg_mix_scratch.push_back(packed);
+					const uint32_t gx_bits = uint32_t(gx);
+					for (int gy = 1; gy < iy_end; gy++)
+						*dst++ = gx_bits | (uint32_t(gy) << 16);
 				}
-			}
-
-			int non_empty_buckets = 0;
-			int single_bucket = -1;
-			for (int b = 0; b < 8; b++)
-			{
-				if (!wg_bucket_scratch[b].empty())
-				{
-					non_empty_buckets++;
-					single_bucket = b;
-				}
-			}
-
-			auto &split = idwt_wg_splits[c][level];
-			if (wg_mix_scratch.empty() && non_empty_buckets == 1)
-			{
-				// Every interior WG shares the exact same active band mask: dispatch 2D grid directly!
-				split.uniform_direct = true;
-				split.uniform_mask = uint8_t(single_bucket);
-			}
-			else if (non_empty_buckets == 0)
-			{
-				// Every interior WG is mixed: dispatch 2D grid directly without indirection!
+				split.ll_count = uint32_t(interior_wgs);
 			}
 			else
 			{
-				split.use_list = true;
-				for (int b = 0; b < 8; b++)
+				const auto &meta = block_meta[c][level][1];
+				const int bx_cnt = meta.block_stride_32x32;
+				const int blk_cnt = meta.block_count_32x32;
+				const int base1 = meta.block_offset_32x32;
+				const int base2 = base1 + blk_cnt;
+				const int base3 = base2 + blk_cnt;
+				const uint32_t *offs = dequant_offset_buffer_cpu.data();
+
+				block_hf_scratch.resize(blk_cnt);
+				uint8_t *blk_hf = block_hf_scratch.data();
+				const bool has1 = (hf_mask & 1u) != 0;
+				const bool has2 = (hf_mask & 2u) != 0;
+				const bool has3 = (hf_mask & 4u) != 0;
+				for (int i = 0; i < blk_cnt; i++)
 				{
-					if (!wg_bucket_scratch[b].empty())
+					uint8_t m = 0;
+					if (has1 && offs[base1 + i] != UINT32_MAX) m |= 1u;
+					if (has2 && offs[base2 + i] != UINT32_MAX) m |= 2u;
+					if (has3 && offs[base3 + i] != UINT32_MAX) m |= 4u;
+					blk_hf[i] = m;
+				}
+
+				wg_ll_scratch.resize(size_t(interior_wgs));
+				wg_all_scratch.resize(size_t(interior_wgs));
+				wg_mix_scratch.resize(size_t(interior_wgs));
+				uint32_t *ll_ptr = wg_ll_scratch.data();
+				uint32_t *all_ptr = wg_all_scratch.data();
+				uint32_t *mix_ptr = wg_mix_scratch.data();
+				uint32_t ll_n = 0, all_n = 0, mix_n = 0;
+
+				// Row-major traversal (gx outer => by fixed, gy inner => sequential bx in block_hf_scratch).
+				for (int gx = 1; gx < ix_end; gx++)
+				{
+					const uint8_t *row0 = blk_hf + ((gx * 16 - 2) >> 5) * bx_cnt;
+					const uint8_t *row1 = blk_hf + ((gx * 16 + 17) >> 5) * bx_cnt;
+					const uint32_t gx_bits = uint32_t(gx);
+					for (int gy = 1; gy < iy_end; gy++)
 					{
-						split.bucket_offset[b] = uint32_t(wg_list_cpu.size());
-						split.bucket_count[b] = uint32_t(wg_bucket_scratch[b].size());
-						wg_list_cpu.insert(wg_list_cpu.end(), wg_bucket_scratch[b].begin(), wg_bucket_scratch[b].end());
+						const int bx0 = (gy * 16 - 2) >> 5;
+						const int bx1 = (gy * 16 + 17) >> 5;
+						const uint8_t m00 = row0[bx0];
+						const uint8_t m01 = row0[bx1];
+						const uint8_t m10 = row1[bx0];
+						const uint8_t m11 = row1[bx1];
+						const uint8_t any_m = m00 | m01 | m10 | m11;
+						const uint32_t packed = gx_bits | (uint32_t(gy) << 16);
+						if (any_m == 0)
+							ll_ptr[ll_n++] = packed;
+						else if ((m00 & m01 & m10 & m11) == 7u)
+							all_ptr[all_n++] = packed;
+						else
+							mix_ptr[mix_n++] = packed;
 					}
 				}
-				if (!wg_mix_scratch.empty())
+
+				if (ll_n > 0)
+				{
+					split.ll_offset = uint32_t(wg_list_cpu.size());
+					split.ll_count = ll_n;
+					wg_list_cpu.insert(wg_list_cpu.end(), ll_ptr, ll_ptr + ll_n);
+				}
+				if (all_n > 0)
+				{
+					split.all_offset = uint32_t(wg_list_cpu.size());
+					split.all_count = all_n;
+					wg_list_cpu.insert(wg_list_cpu.end(), all_ptr, all_ptr + all_n);
+				}
+				if (mix_n > 0)
 				{
 					split.mix_offset = uint32_t(wg_list_cpu.size());
-					split.mix_count = uint32_t(wg_mix_scratch.size());
-					wg_list_cpu.insert(wg_list_cpu.end(), wg_mix_scratch.begin(), wg_mix_scratch.end());
+					split.mix_count = mix_n;
+					wg_list_cpu.insert(wg_list_cpu.end(), mix_ptr, mix_ptr + mix_n);
 				}
 			}
+
+			// Pack all 4 disjoint border strips into one edge dispatch.
+			split.edge_offset = uint32_t(wg_list_cpu.size());
+			const int edge_total = nx * ny - interior_wgs;
+			wg_list_cpu.resize(wg_list_cpu.size() + size_t(edge_total));
+			uint32_t *edst = wg_list_cpu.data() + split.edge_offset;
+			for (int gy = 0; gy < ny; gy++)
+				*edst++ = uint32_t(gy) << 16; // gx = 0
+			for (int gx = ix_end; gx < nx; gx++)
+			{
+				const uint32_t gx_bits = uint32_t(gx);
+				for (int gy = 0; gy < ny; gy++)
+					*edst++ = gx_bits | (uint32_t(gy) << 16);
+			}
+			for (int gx = 1; gx < ix_end; gx++)
+				*edst++ = uint32_t(gx); // gy = 0
+			for (int gx = 1; gx < ix_end; gx++)
+			{
+				const uint32_t gx_bits = uint32_t(gx);
+				for (int gy = iy_end; gy < ny; gy++)
+					*edst++ = gx_bits | (uint32_t(gy) << 16);
+			}
+			split.edge_count = uint32_t(edge_total);
 		}
 	}
 }
@@ -544,7 +577,7 @@ void Decoder::Impl::init_block_meta()
 	if (packed_2x2_wavelets)
 	{
 		BufferCreateInfo wg_info;
-		wg_info.size = 64 * 1024;
+		wg_info.size = 128 * 1024;
 		wg_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
 		                (use_uma_upload ? 0 : VK_BUFFER_USAGE_TRANSFER_DST_BIT);
 		wg_info.domain = use_uma_upload ? BufferDomain::LinkedDeviceHost : BufferDomain::Device;
@@ -563,6 +596,7 @@ void Decoder::Impl::init_block_meta()
 			if (wg_list_buffer)
 				device->set_name(*wg_list_buffer, "idwt-wg-list");
 		}
+		wg_list_cpu.reserve(32 * 1024);
 	}
 
 	dequant_offset_buffer_cpu.resize(block_count_32x32);
@@ -1052,6 +1086,55 @@ bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 		int32_t wg_offset_y;
 	} push = {};
 
+	// Prewarm the small fixed set of packed iDWT pipelines once so scene changes never trigger
+	// mid-stream shader compilation stalls on the decode thread.
+	if (packed_2x2_wavelets)
+	{
+		const auto prewarm_one = [&](Program *prog, bool final_out, float rscale,
+		                             bool edge_pass, uint32_t band_mask, bool indirect_list, bool mask_check) {
+			if (!prog)
+				return;
+			cmd.set_program(prog);
+			const uint32_t smask = (final_out ? 0x3u : 0x0u) | 0x4u | 0x8u | 0x10u | 0x20u;
+			cmd.set_specialization_constant_mask(smask);
+			if (final_out)
+			{
+				cmd.set_specialization_constant(0, true);
+				cmd.set_specialization_constant(1, rscale);
+			}
+			cmd.set_specialization_constant(2, edge_pass);
+			cmd.set_specialization_constant(3, band_mask);
+			cmd.set_specialization_constant(4, indirect_list);
+			cmd.set_specialization_constant(5, mask_check);
+			DeferredPipelineCompile compile = {};
+			cmd.extract_pipeline_state(compile);
+			if (!prog->get_pipeline(compile.hash).pipeline)
+				CommandBuffer::build_compute_pipeline(device, compile, CommandBuffer::CompileMode::Sync);
+		};
+
+		if (!prewarmed_idwt_intermediate)
+		{
+			Program *p = shaders.idwt[prec][1][1];
+			prewarm_one(p, false, 1.0f, false, 0u, true, false);  // LLOnly
+			prewarm_one(p, false, 1.0f, false, 7u, true, false);  // AllActive
+			prewarm_one(p, false, 1.0f, false, 7u, true, true);   // Mixed
+			prewarm_one(p, false, 1.0f, true,  7u, true, true);   // EdgeList
+			prewarm_one(p, false, 1.0f, true,  7u, false, true);  // SmallDirect (L2)
+			prewarmed_idwt_intermediate = true;
+		}
+		if (!prewarmed_idwt_final || prewarmed_range_scale != views.range_scale)
+		{
+			Program *p = shaders.idwt[prec][1][0];
+			prewarm_one(p, true, views.range_scale, false, 0u, true, false); // LLOnly
+			prewarm_one(p, true, views.range_scale, false, 7u, true, false); // AllActive
+			prewarm_one(p, true, views.range_scale, false, 7u, true, true);  // Mixed
+			prewarm_one(p, true, views.range_scale, true,  7u, true, true);  // EdgeList
+			prewarmed_idwt_final = true;
+			prewarmed_range_scale = views.range_scale;
+		}
+		cmd.set_specialization_constant_mask(0);
+	}
+
 	for (int input_level = DecompositionLevels - 1; input_level >= 0; input_level--)
 	{
 		const bool packed_in = level_is_packed_2x2(input_level);
@@ -1071,7 +1154,6 @@ bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 
 			if (packed_in)
 			{
-				const uint32_t hf_mask = (active_band_mask[c][input_level] >> 1) & 0x7u;
 				const auto &split = idwt_wg_splits[c][input_level];
 				const auto &meta = block_meta[c][input_level][1];
 				push.block_offset_32x32 = meta.block_offset_32x32;
@@ -1089,101 +1171,55 @@ bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 					cmd.set_specialization_constant(1, views.range_scale);
 				}
 
-				if (push.resolution.x >= 34 && push.resolution.y >= 34)
+				if (split.use_list)
 				{
-					const int ix_end = std::min<int>(nx, (push.resolution.x - 18) / 16 + 1);
-					const int iy_end = std::min<int>(ny, (push.resolution.y - 18) / 16 + 1);
+					cmd.set_specialization_constant(2, false);
+					cmd.set_specialization_constant(4, true);
 
-					if (ix_end > 1 && iy_end > 1)
+					if (split.ll_count > 0)
 					{
-						// Hot interior pass(es): dead-code-eliminates all edge mirroring,
-						// inactive bands, and per-quad mask checks where unnecessary.
-						cmd.set_specialization_constant(2, false);
-						if (split.use_list)
-						{
-							cmd.set_specialization_constant(4, true);
-							cmd.set_specialization_constant(5, false);
-							for (uint32_t b = 0; b < 8; b++)
-							{
-								if (split.bucket_count[b] > 0)
-								{
-									cmd.set_specialization_constant(3, b);
-									push.wg_offset_x = int32_t(split.bucket_offset[b]);
-									push.wg_offset_y = 0;
-									cmd.push_constants(&push, 0, sizeof(push));
-									cmd.dispatch(split.bucket_count[b], 1, 1);
-								}
-							}
-							if (split.mix_count > 0)
-							{
-								cmd.set_specialization_constant(3, hf_mask);
-								cmd.set_specialization_constant(5, true);
-								push.wg_offset_x = int32_t(split.mix_offset);
-								push.wg_offset_y = 0;
-								cmd.push_constants(&push, 0, sizeof(push));
-								cmd.dispatch(split.mix_count, 1, 1);
-							}
-						}
-						else
-						{
-							cmd.set_specialization_constant(4, false);
-							cmd.set_specialization_constant(3, split.uniform_direct ? uint32_t(split.uniform_mask) : hf_mask);
-							cmd.set_specialization_constant(5, !split.uniform_direct && hf_mask != 0u);
-							push.wg_offset_x = 1;
-							push.wg_offset_y = 1;
-							cmd.push_constants(&push, 0, sizeof(push));
-							cmd.dispatch(ix_end - 1, iy_end - 1, 1);
-						}
-
-						// Disjoint 1-WG border strips (no barrier needed against interior).
-						cmd.set_specialization_constant(2, true);
-						cmd.set_specialization_constant(3, hf_mask);
-						cmd.set_specialization_constant(4, false);
-						cmd.set_specialization_constant(5, hf_mask != 0u);
-						push.wg_offset_x = 0;
+						cmd.set_specialization_constant(3, 0u);
+						cmd.set_specialization_constant(5, false);
+						push.wg_offset_x = int32_t(split.ll_offset);
 						push.wg_offset_y = 0;
 						cmd.push_constants(&push, 0, sizeof(push));
-						cmd.dispatch(1, ny, 1);
-
-						if (nx > ix_end)
-						{
-							push.wg_offset_x = ix_end;
-							push.wg_offset_y = 0;
-							cmd.push_constants(&push, 0, sizeof(push));
-							cmd.dispatch(nx - ix_end, ny, 1);
-						}
-
-						push.wg_offset_x = 1;
-						push.wg_offset_y = 0;
-						cmd.push_constants(&push, 0, sizeof(push));
-						cmd.dispatch(ix_end - 1, 1, 1);
-
-						if (ny > iy_end)
-						{
-							push.wg_offset_x = 1;
-							push.wg_offset_y = iy_end;
-							cmd.push_constants(&push, 0, sizeof(push));
-							cmd.dispatch(ix_end - 1, ny - iy_end, 1);
-						}
+						cmd.dispatch(split.ll_count, 1, 1);
 					}
-					else
+					if (split.all_count > 0)
 					{
-						cmd.set_specialization_constant(2, true);
-						cmd.set_specialization_constant(3, hf_mask);
-						cmd.set_specialization_constant(4, false);
-						cmd.set_specialization_constant(5, hf_mask != 0u);
-						push.wg_offset_x = 0;
+						cmd.set_specialization_constant(3, 7u);
+						cmd.set_specialization_constant(5, false);
+						push.wg_offset_x = int32_t(split.all_offset);
 						push.wg_offset_y = 0;
 						cmd.push_constants(&push, 0, sizeof(push));
-						cmd.dispatch(nx, ny, 1);
+						cmd.dispatch(split.all_count, 1, 1);
+					}
+					if (split.mix_count > 0)
+					{
+						cmd.set_specialization_constant(3, 7u);
+						cmd.set_specialization_constant(5, true);
+						push.wg_offset_x = int32_t(split.mix_offset);
+						push.wg_offset_y = 0;
+						cmd.push_constants(&push, 0, sizeof(push));
+						cmd.dispatch(split.mix_count, 1, 1);
+					}
+					if (split.edge_count > 0)
+					{
+						cmd.set_specialization_constant(2, true);
+						cmd.set_specialization_constant(3, 7u);
+						cmd.set_specialization_constant(5, true);
+						push.wg_offset_x = int32_t(split.edge_offset);
+						push.wg_offset_y = 0;
+						cmd.push_constants(&push, 0, sizeof(push));
+						cmd.dispatch(split.edge_count, 1, 1);
 					}
 				}
 				else
 				{
 					cmd.set_specialization_constant(2, true);
-					cmd.set_specialization_constant(3, hf_mask);
+					cmd.set_specialization_constant(3, 7u);
 					cmd.set_specialization_constant(4, false);
-					cmd.set_specialization_constant(5, hf_mask != 0u);
+					cmd.set_specialization_constant(5, true);
 					push.wg_offset_x = 0;
 					push.wg_offset_y = 0;
 					cmd.push_constants(&push, 0, sizeof(push));
