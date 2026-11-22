@@ -132,20 +132,101 @@ void WaveletBuffers::allocate_images_fragment()
 
 void WaveletBuffers::allocate_images()
 {
+	int prec = Configuration::get().get_precision();
+	if (packed_2x2_wavelets)
+	{
+		// Levels 0..DecompositionLevels-2 are guaranteed even in both dimensions
+		// (aligned_width/height are multiples of 32), so we pack 2x2 spatial quads
+		// into RGBA texels. The coarsest level (level == DecompositionLevels - 1)
+		// may have odd dimensions and stays scalar.
+		constexpr int PackedLevels = DecompositionLevels - 1;
+		auto info = ImageCreateInfo::immutable_2d_image(
+				aligned_width / 4, aligned_height / 4,
+				prec == 2 ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT);
+		info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+		             VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+		info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+		info.layers = NumFrequencyBandsPerLevel * NumComponents;
+		info.layout = ImageLayout::General;
+		info.levels = prec != 1 ? PackedLevels : WaveletFP16Levels;
+
+		wavelet_img_high_res = device->create_image(info);
+		device->set_name(*wavelet_img_high_res, "wavelet-buffer-high-res-2x2");
+
+		if (prec == 1)
+		{
+			info.levels = PackedLevels - WaveletFP16Levels;
+			info.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+			info.width >>= WaveletFP16Levels;
+			info.height >>= WaveletFP16Levels;
+			wavelet_img_low_res = device->create_image(info);
+			device->set_name(*wavelet_img_low_res, "wavelet-buffer-low-res-2x2");
+		}
+
+		auto coarse_info = ImageCreateInfo::immutable_2d_image(
+				aligned_width >> DecompositionLevels, aligned_height >> DecompositionLevels,
+				prec == 0 ? VK_FORMAT_R16_SFLOAT : VK_FORMAT_R32_SFLOAT);
+		coarse_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+		                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+		coarse_info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+		coarse_info.layers = NumFrequencyBandsPerLevel * NumComponents;
+		coarse_info.layout = ImageLayout::General;
+		coarse_info.levels = 1;
+		wavelet_img_coarsest = device->create_image(coarse_info);
+		device->set_name(*wavelet_img_coarsest, "wavelet-buffer-coarsest");
+
+		for (int level = 0; level < DecompositionLevels; level++)
+		{
+			ImageViewCreateInfo view_info = {};
+			view_info.levels = 1;
+			view_info.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+
+			if (level == DecompositionLevels - 1)
+			{
+				view_info.base_level = 0;
+				view_info.image = wavelet_img_coarsest.get();
+			}
+			else if (prec != 1 || level < WaveletFP16Levels)
+			{
+				view_info.base_level = level;
+				view_info.image = wavelet_img_high_res.get();
+			}
+			else
+			{
+				view_info.base_level = level - WaveletFP16Levels;
+				view_info.image = wavelet_img_low_res.get();
+			}
+
+			for (int component = 0; component < NumComponents; component++)
+			{
+				view_info.base_layer = 4 * component;
+
+				view_info.view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+				view_info.layers = 4;
+				component_layer_views[component][level] = device->create_image_view(view_info);
+
+				view_info.view_type = VK_IMAGE_VIEW_TYPE_2D;
+				view_info.layers = 1;
+				component_ll_views[component][level] = device->create_image_view(view_info);
+			}
+		}
+		return;
+	}
+
 	auto info = ImageCreateInfo::immutable_2d_image(
 			aligned_width / 2, aligned_height / 2,
-			Configuration::get().get_precision() == 2 ? VK_FORMAT_R32_SFLOAT : VK_FORMAT_R16_SFLOAT);
+			prec == 2 ? VK_FORMAT_R32_SFLOAT : VK_FORMAT_R16_SFLOAT);
 	info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
 	             VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 	info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
 	info.layers = NumFrequencyBandsPerLevel * NumComponents;
 	info.layout = ImageLayout::General;
-	info.levels = Configuration::get().get_precision() != 1 ? DecompositionLevels : WaveletFP16Levels;
+	info.levels = prec != 1 ? DecompositionLevels : WaveletFP16Levels;
 
 	wavelet_img_high_res = device->create_image(info);
 	device->set_name(*wavelet_img_high_res, "wavelet-buffer-high-res");
 
-	if (Configuration::get().get_precision() == 1)
+	if (prec == 1)
 	{
 		// For the lowest level bands, we want to maintain precision as much as possible and bandwidth here is trivial.
 		info.levels = DecompositionLevels - info.levels;
@@ -162,7 +243,7 @@ void WaveletBuffers::allocate_images()
 		view_info.levels = 1;
 		view_info.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
 
-		if (Configuration::get().get_precision() != 1 || level < WaveletFP16Levels)
+		if (prec != 1 || level < WaveletFP16Levels)
 		{
 			view_info.base_level = level;
 			view_info.image = wavelet_img_high_res.get();
@@ -222,8 +303,8 @@ void WaveletBuffers::init_block_meta()
 
 			for (int band = (level == DecompositionLevels - 1 ? 0 : 1); band < 4; band++)
 			{
-				uint32_t level_width = wavelet_img_high_res->get_width(level);
-				uint32_t level_height = wavelet_img_high_res->get_height(level);
+				uint32_t level_width = get_level_width(level);
+				uint32_t level_height = get_level_height(level);
 
 				int blocks_x_8x8 = (level_width + 7) / 8;
 				int blocks_y_8x8 = (level_height + 7) / 8;
@@ -242,13 +323,15 @@ void WaveletBuffers::init_block_meta()
 	}
 }
 
-bool WaveletBuffers::init(Device *device_, int width_, int height_, ChromaSubsampling chroma_, bool fragment_path_)
+bool WaveletBuffers::init(Device *device_, int width_, int height_, ChromaSubsampling chroma_, bool fragment_path_,
+                          bool packed_2x2_wavelets_)
 {
 	device = device_;
 	width = width_;
 	height = height_;
 	chroma = chroma_;
 	fragment_path = fragment_path_;
+	packed_2x2_wavelets = packed_2x2_wavelets_ && !fragment_path_;
 
 	aligned_width = align(width, Alignment);
 	aligned_height = align(height, Alignment);

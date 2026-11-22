@@ -13,6 +13,10 @@
 #extension GL_EXT_shader_16bit_storage : require
 #endif
 
+#ifndef PACKED_2X2
+#define PACKED_2X2 0
+#endif
+
 layout(local_size_x = 128) in;
 
 layout(set = 0, binding = 0) writeonly uniform image2DArray uDequantImg;
@@ -305,9 +309,11 @@ void main()
 
     if (offset_u32 == ~0u)
     {
+#if !PACKED_2X2
         for (int j = 0; j < 2; j++)
             for (int i = 0; i < 4; i++)
                 imageStore(uDequantImg, ivec3(coord + ivec2(i, j), output_layer), vec4(0.0));
+#endif
         return;
     }
 
@@ -466,7 +472,14 @@ void main()
     }
 
     // Write output.
+#if PACKED_2X2
+    // coord is aligned to (4, 2); pack each 2x2 spatial quad into one RGBA texel.
+    ivec2 q = coord >> 1;
+    imageStore(uDequantImg, ivec3(q.x + 0, q.y, output_layer), vec4(v[0].x, v[0].y, v[1].x, v[1].y));
+    imageStore(uDequantImg, ivec3(q.x + 1, q.y, output_layer), vec4(v[0].z, v[0].w, v[1].z, v[1].w));
+#else
     for (int j = 0; j < 2; j++)
         for (int i = 0; i < 4; i++)
             imageStore(uDequantImg, ivec3(coord + ivec2(i, j), output_layer), vec4(v[j][i]));
+#endif
 }

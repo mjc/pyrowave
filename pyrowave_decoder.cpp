@@ -48,7 +48,7 @@ struct Decoder::Impl final : public WaveletBuffers
 {
 	static constexpr uint32_t kUmaRingSlots = 4;
 
-	BufferHandle dequant_offset_buffer, payload_data;
+	BufferHandle dequant_offset_buffer, payload_data, wg_list_buffer;
 	BufferViewHandle payload_u32_view, payload_u16_view, payload_u8_view;
 
 	// Ring-buffered zero-copy UMA upload buffers (used when !use_readonly_texel_buffer and UMA heap is present).
@@ -56,6 +56,7 @@ struct Decoder::Impl final : public WaveletBuffers
 	uint32_t uma_slot = 0;
 	BufferHandle uma_dequant_offset[kUmaRingSlots];
 	BufferHandle uma_payload_data[kUmaRingSlots];
+	BufferHandle uma_wg_list[kUmaRingSlots];
 
 	// Turbo-hacky path.
 	DeviceAllocationOwnerHandle linear_memory;
@@ -64,6 +65,24 @@ struct Decoder::Impl final : public WaveletBuffers
 
 	std::vector<uint32_t> dequant_offset_buffer_cpu;
 	std::vector<uint32_t> payload_data_cpu;
+	// Per-block lookup packed as (level << 4) | (component << 2) | band for O(1) active tracking.
+	std::vector<uint8_t> block_to_comp_level_band;
+	uint8_t active_band_mask[NumComponents][DecompositionLevels] = {};
+	struct IdwtWgSplit
+	{
+		uint32_t bucket_offset[8] = {};
+		uint32_t bucket_count[8] = {};
+		uint32_t mix_offset = 0;
+		uint32_t mix_count = 0;
+		bool use_list = false;
+		bool uniform_direct = false;
+		uint8_t uniform_mask = 0;
+	};
+	IdwtWgSplit idwt_wg_splits[NumComponents][DecompositionLevels] = {};
+	std::vector<uint32_t> wg_list_cpu;
+	std::vector<uint32_t> wg_bucket_scratch[8];
+	std::vector<uint32_t> wg_mix_scratch;
+	std::vector<uint8_t> block_hf_scratch;
 	int decoded_blocks = 0;
 	int total_blocks_in_sequence = 0;
 	uint32_t last_seq = UINT32_MAX;
@@ -86,6 +105,7 @@ struct Decoder::Impl final : public WaveletBuffers
 
 	void upload_payload(CommandBuffer &cmd);
 	bool upload_payload_uma();
+	void build_idwt_wg_lists();
 
 	void check_linear_texture_support();
 };
@@ -202,7 +222,153 @@ bool Decoder::Impl::upload_payload_uma()
 		device->unmap_host_buffer(*offset_buf, MEMORY_ACCESS_WRITE_BIT);
 	}
 
+	if (packed_2x2_wavelets && !wg_list_cpu.empty())
+	{
+		auto &wg_buf = uma_wg_list[uma_slot];
+		VkDeviceSize wg_size = wg_list_cpu.size() * sizeof(uint32_t);
+		if (!wg_buf || wg_size > wg_buf->get_create_info().size)
+		{
+			BufferCreateInfo bufinfo;
+			bufinfo.size = std::max<VkDeviceSize>(64 * 1024, wg_size * 2);
+			bufinfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+			bufinfo.domain = BufferDomain::LinkedDeviceHost;
+			wg_buf = device->create_buffer(bufinfo);
+			if (!wg_buf)
+				return false;
+			device->set_name(*wg_buf, "idwt-wg-list-uma");
+		}
+		auto *wg_dst = static_cast<uint8_t *>(device->map_host_buffer(*wg_buf, MEMORY_ACCESS_WRITE_BIT));
+		if (!wg_dst)
+			return false;
+		memcpy(wg_dst, wg_list_cpu.data(), wg_size);
+		device->unmap_host_buffer(*wg_buf, MEMORY_ACCESS_WRITE_BIT);
+	}
+
 	return true;
+}
+
+void Decoder::Impl::build_idwt_wg_lists()
+{
+	wg_list_cpu.clear();
+	memset(idwt_wg_splits, 0, sizeof(idwt_wg_splits));
+	if (!packed_2x2_wavelets)
+		return;
+
+	for (int level = 0; level < DecompositionLevels - 1; level++)
+	{
+		const int res_x = int(get_level_height(level));
+		const int res_y = int(get_level_width(level));
+		if (res_x < 34 || res_y < 34)
+			continue;
+
+		const int nx = (res_x + 15) / 16;
+		const int ny = (res_y + 15) / 16;
+		const int ix_end = std::min<int>(nx, (res_x - 18) / 16 + 1);
+		const int iy_end = std::min<int>(ny, (res_y - 18) / 16 + 1);
+		if (ix_end <= 1 || iy_end <= 1)
+			continue;
+
+		const int interior_wgs = (ix_end - 1) * (iy_end - 1);
+		// Only worthwhile when there are enough interior WGs to amortize indirect lookup.
+		if (interior_wgs < 256)
+			continue;
+
+		for (int c = 0; c < NumComponents; c++)
+		{
+			if (level == 0 && c != 0 && chroma == ChromaSubsampling::Chroma420)
+				continue;
+
+			const uint8_t hf_mask = (active_band_mask[c][level] >> 1) & 0x7u;
+			if (hf_mask == 0)
+				continue;
+
+			const auto &meta = block_meta[c][level][1];
+			const int bx_cnt = meta.block_stride_32x32;
+			const int blk_cnt = meta.block_count_32x32;
+			const int base1 = meta.block_offset_32x32;
+			const int base2 = base1 + blk_cnt;
+			const int base3 = base2 + blk_cnt;
+			const uint32_t *offs = dequant_offset_buffer_cpu.data();
+
+			block_hf_scratch.resize(blk_cnt);
+			for (int i = 0; i < blk_cnt; i++)
+			{
+				uint8_t m = 0;
+				if ((hf_mask & 1u) && offs[base1 + i] != UINT32_MAX) m |= 1u;
+				if ((hf_mask & 2u) && offs[base2 + i] != UINT32_MAX) m |= 2u;
+				if ((hf_mask & 4u) && offs[base3 + i] != UINT32_MAX) m |= 4u;
+				block_hf_scratch[i] = m;
+			}
+
+			for (int b = 0; b < 8; b++)
+				wg_bucket_scratch[b].clear();
+			wg_mix_scratch.clear();
+
+			for (int gy = 1; gy < iy_end; gy++)
+			{
+				const int bx0 = (gy * 16 - 2) >> 5;
+				const int bx1 = (gy * 16 + 17) >> 5;
+				for (int gx = 1; gx < ix_end; gx++)
+				{
+					const int by0 = (gx * 16 - 2) >> 5;
+					const int by1 = (gx * 16 + 17) >> 5;
+					const uint8_t m00 = block_hf_scratch[by0 * bx_cnt + bx0];
+					const uint8_t m01 = block_hf_scratch[by0 * bx_cnt + bx1];
+					const uint8_t m10 = block_hf_scratch[by1 * bx_cnt + bx0];
+					const uint8_t m11 = block_hf_scratch[by1 * bx_cnt + bx1];
+					const uint8_t any_m = m00 | m01 | m10 | m11;
+					const uint8_t all_m = m00 & m01 & m10 & m11;
+					const uint32_t packed = uint32_t(gx) | (uint32_t(gy) << 16);
+					if (any_m == all_m)
+						wg_bucket_scratch[any_m].push_back(packed);
+					else
+						wg_mix_scratch.push_back(packed);
+				}
+			}
+
+			int non_empty_buckets = 0;
+			int single_bucket = -1;
+			for (int b = 0; b < 8; b++)
+			{
+				if (!wg_bucket_scratch[b].empty())
+				{
+					non_empty_buckets++;
+					single_bucket = b;
+				}
+			}
+
+			auto &split = idwt_wg_splits[c][level];
+			if (wg_mix_scratch.empty() && non_empty_buckets == 1)
+			{
+				// Every interior WG shares the exact same active band mask: dispatch 2D grid directly!
+				split.uniform_direct = true;
+				split.uniform_mask = uint8_t(single_bucket);
+			}
+			else if (non_empty_buckets == 0)
+			{
+				// Every interior WG is mixed: dispatch 2D grid directly without indirection!
+			}
+			else
+			{
+				split.use_list = true;
+				for (int b = 0; b < 8; b++)
+				{
+					if (!wg_bucket_scratch[b].empty())
+					{
+						split.bucket_offset[b] = uint32_t(wg_list_cpu.size());
+						split.bucket_count[b] = uint32_t(wg_bucket_scratch[b].size());
+						wg_list_cpu.insert(wg_list_cpu.end(), wg_bucket_scratch[b].begin(), wg_bucket_scratch[b].end());
+					}
+				}
+				if (!wg_mix_scratch.empty())
+				{
+					split.mix_offset = uint32_t(wg_list_cpu.size());
+					split.mix_count = uint32_t(wg_mix_scratch.size());
+					wg_list_cpu.insert(wg_list_cpu.end(), wg_mix_scratch.begin(), wg_mix_scratch.end());
+				}
+			}
+		}
+	}
 }
 
 bool Decoder::Impl::decode_packet(const BitstreamHeader *header)
@@ -212,6 +378,8 @@ bool Decoder::Impl::decode_packet(const BitstreamHeader *header)
 	{
 		decoded_blocks++;
 		offset = payload_data_cpu.size();
+		uint8_t clb = block_to_comp_level_band[header->block_index];
+		active_band_mask[(clb >> 2) & 3u][clb >> 4] |= uint8_t(1u << (clb & 3u));
 	}
 	else
 	{
@@ -373,7 +541,48 @@ void Decoder::Impl::init_block_meta()
 		device->set_name(*dequant_offset_buffer, "meta-buffer");
 	}
 
+	if (packed_2x2_wavelets)
+	{
+		BufferCreateInfo wg_info;
+		wg_info.size = 64 * 1024;
+		wg_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+		                (use_uma_upload ? 0 : VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+		wg_info.domain = use_uma_upload ? BufferDomain::LinkedDeviceHost : BufferDomain::Device;
+		if (use_uma_upload)
+		{
+			for (uint32_t i = 0; i < kUmaRingSlots; i++)
+			{
+				uma_wg_list[i] = device->create_buffer(wg_info);
+				if (uma_wg_list[i])
+					device->set_name(*uma_wg_list[i], "idwt-wg-list-uma");
+			}
+		}
+		else
+		{
+			wg_list_buffer = device->create_buffer(wg_info);
+			if (wg_list_buffer)
+				device->set_name(*wg_list_buffer, "idwt-wg-list");
+		}
+	}
+
 	dequant_offset_buffer_cpu.resize(block_count_32x32);
+	block_to_comp_level_band.assign(block_count_32x32, 0);
+	for (int level = 0; level < DecompositionLevels; level++)
+	{
+		for (int component = 0; component < NumComponents; component++)
+		{
+			if (level == 0 && component != 0 && chroma == ChromaSubsampling::Chroma420)
+				continue;
+			int first_band = level == DecompositionLevels - 1 ? 0 : 1;
+			for (int band = first_band; band < 4; band++)
+			{
+				const auto &m = block_meta[component][level][band];
+				uint8_t clb = uint8_t((level << 4) | (component << 2) | band);
+				for (int i = 0; i < m.block_count_32x32; i++)
+					block_to_comp_level_band[m.block_offset_32x32 + i] = clb;
+			}
+		}
+	}
 
 	payload_data_cpu.reserve(1024 * 1024);
 }
@@ -406,14 +615,15 @@ bool Decoder::Impl::dequant(CommandBuffer &cmd)
 	if (!payload_r8_image && !use_readonly_texel_buffer && !active_payload_data)
 		return false;
 
+	int storage_mode;
 	if (payload_r8_image && payload_r16_image && payload_r32_image)
-		cmd.set_program(shaders.wavelet_dequant[2]);
+		storage_mode = 2;
 	else if (use_readonly_texel_buffer)
-		cmd.set_program(shaders.wavelet_dequant[1]);
+		storage_mode = 1;
 	else if (use_ssbo32_payload)
-		cmd.set_program(shaders.wavelet_dequant[3]);
+		storage_mode = 3;
 	else
-		cmd.set_program(shaders.wavelet_dequant[0]);
+		storage_mode = 0;
 
 	cmd.begin_region("DWT dequant");
 	auto start_dequant = cmd.write_timestamp(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
@@ -431,13 +641,27 @@ bool Decoder::Impl::dequant(CommandBuffer &cmd)
 		                  VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
 	}
 
+	if (wavelet_img_coarsest)
+	{
+		cmd.image_barrier(*wavelet_img_coarsest, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+		                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+		                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		                  VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+	}
+
 	// De-quantize
 	for (int level = 0; level < DecompositionLevels; level++)
 	{
+		cmd.set_program(shaders.wavelet_dequant[storage_mode][level_is_packed_2x2(level) ? 1 : 0]);
 		for (int component = 0; component < NumComponents; component++)
 		{
 			// Ignore top-level CbCr when doing 420 subsampling.
 			if (level == 0 && component != 0 && chroma == ChromaSubsampling::Chroma420)
+				continue;
+
+			// Packed levels skip zeroing empty blocks in dequant (iDWT checks payload_offsets),
+			// so a component/level with zero active blocks needs no dequant dispatch at all.
+			if (level_is_packed_2x2(level) && ((active_band_mask[component][level] >> 1) & 0x7u) == 0)
 				continue;
 
 			char label[128];
@@ -445,8 +669,8 @@ bool Decoder::Impl::dequant(CommandBuffer &cmd)
 			cmd.begin_region(label);
 
 			int first_band = level == DecompositionLevels - 1 ? 0 : 1;
-			push.resolution.x = wavelet_img_high_res->get_width(level);
-			push.resolution.y = wavelet_img_high_res->get_height(level);
+			push.resolution.x = int32_t(get_level_width(level));
+			push.resolution.y = int32_t(get_level_height(level));
 			push.output_layer = first_band;
 			push.block_offset_32x32 = block_meta[component][level][first_band].block_offset_32x32;
 			push.block_stride_32x32 = block_meta[component][level][first_band].block_stride_32x32;
@@ -807,7 +1031,12 @@ bool Decoder::Impl::idwt_fragment(CommandBuffer &cmd, const ViewBuffers &views)
 
 bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 {
-	cmd.set_program(shaders.idwt[Configuration::get().get_precision()]);
+	const int prec = Configuration::get().get_precision();
+	const Buffer *active_dequant_offset = use_uma_upload ? uma_dequant_offset[uma_slot].get() : dequant_offset_buffer.get();
+	const Buffer *active_wg_list = use_uma_upload ? uma_wg_list[uma_slot].get() : wg_list_buffer.get();
+	if (packed_2x2_wavelets && (!active_dequant_offset || !active_wg_list))
+		return false;
+
 	cmd.enable_subgroup_size_control(false);
 
 	auto start_idwt = cmd.write_timestamp(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
@@ -816,24 +1045,167 @@ bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 	{
 		ivec2 resolution;
 		vec2 inv_resolution;
+		int32_t block_offset_32x32;
+		int32_t block_stride_32x32;
+		int32_t band_stride_32x32;
+		int32_t wg_offset_x;
+		int32_t wg_offset_y;
 	} push = {};
 
 	for (int input_level = DecompositionLevels - 1; input_level >= 0; input_level--)
 	{
+		const bool packed_in = level_is_packed_2x2(input_level);
 		// Transposed.
-		push.resolution.x = component_layer_views[0][input_level]->get_view_height();
-		push.resolution.y = component_layer_views[0][input_level]->get_view_width();
+		push.resolution.x = int32_t(get_level_height(input_level));
+		push.resolution.y = int32_t(get_level_width(input_level));
 		push.inv_resolution.x = 1.0f / float(push.resolution.x);
 		push.inv_resolution.y = 1.0f / float(push.resolution.y);
-		cmd.push_constants(&push, 0, sizeof(push));
-		cmd.set_specialization_constant_mask(3);
-		cmd.set_specialization_constant(0, false);
-		cmd.set_specialization_constant(1, 1.0f);
+
+		const int nx = (push.resolution.x + 15) / 16;
+		const int ny = (push.resolution.y + 15) / 16;
+
+		const auto dispatch_component = [&](int c, bool final_output, const ImageView &dst_view) {
+			const bool packed_out = !final_output && level_is_packed_2x2(input_level - 1);
+			cmd.set_program(shaders.idwt[prec][packed_in ? 1 : 0][packed_out ? 1 : 0]);
+			cmd.set_storage_texture(0, 1, dst_view);
+
+			if (packed_in)
+			{
+				const uint32_t hf_mask = (active_band_mask[c][input_level] >> 1) & 0x7u;
+				const auto &split = idwt_wg_splits[c][input_level];
+				const auto &meta = block_meta[c][input_level][1];
+				push.block_offset_32x32 = meta.block_offset_32x32;
+				push.block_stride_32x32 = meta.block_stride_32x32;
+				push.band_stride_32x32 = meta.block_count_32x32;
+				cmd.set_texture(0, 0, *component_layer_views[c][input_level]);
+				cmd.set_storage_buffer(0, 2, *active_dequant_offset);
+				cmd.set_storage_buffer(0, 3, *active_wg_list);
+
+				uint32_t spec_mask = (final_output ? 0x3u : 0x0u) | 0x4u | 0x8u | 0x10u | 0x20u;
+				cmd.set_specialization_constant_mask(spec_mask);
+				if (final_output)
+				{
+					cmd.set_specialization_constant(0, true);
+					cmd.set_specialization_constant(1, views.range_scale);
+				}
+
+				if (push.resolution.x >= 34 && push.resolution.y >= 34)
+				{
+					const int ix_end = std::min<int>(nx, (push.resolution.x - 18) / 16 + 1);
+					const int iy_end = std::min<int>(ny, (push.resolution.y - 18) / 16 + 1);
+
+					if (ix_end > 1 && iy_end > 1)
+					{
+						// Hot interior pass(es): dead-code-eliminates all edge mirroring,
+						// inactive bands, and per-quad mask checks where unnecessary.
+						cmd.set_specialization_constant(2, false);
+						if (split.use_list)
+						{
+							cmd.set_specialization_constant(4, true);
+							cmd.set_specialization_constant(5, false);
+							for (uint32_t b = 0; b < 8; b++)
+							{
+								if (split.bucket_count[b] > 0)
+								{
+									cmd.set_specialization_constant(3, b);
+									push.wg_offset_x = int32_t(split.bucket_offset[b]);
+									push.wg_offset_y = 0;
+									cmd.push_constants(&push, 0, sizeof(push));
+									cmd.dispatch(split.bucket_count[b], 1, 1);
+								}
+							}
+							if (split.mix_count > 0)
+							{
+								cmd.set_specialization_constant(3, hf_mask);
+								cmd.set_specialization_constant(5, true);
+								push.wg_offset_x = int32_t(split.mix_offset);
+								push.wg_offset_y = 0;
+								cmd.push_constants(&push, 0, sizeof(push));
+								cmd.dispatch(split.mix_count, 1, 1);
+							}
+						}
+						else
+						{
+							cmd.set_specialization_constant(4, false);
+							cmd.set_specialization_constant(3, split.uniform_direct ? uint32_t(split.uniform_mask) : hf_mask);
+							cmd.set_specialization_constant(5, !split.uniform_direct && hf_mask != 0u);
+							push.wg_offset_x = 1;
+							push.wg_offset_y = 1;
+							cmd.push_constants(&push, 0, sizeof(push));
+							cmd.dispatch(ix_end - 1, iy_end - 1, 1);
+						}
+
+						// Disjoint 1-WG border strips (no barrier needed against interior).
+						cmd.set_specialization_constant(2, true);
+						cmd.set_specialization_constant(3, hf_mask);
+						cmd.set_specialization_constant(4, false);
+						cmd.set_specialization_constant(5, hf_mask != 0u);
+						push.wg_offset_x = 0;
+						push.wg_offset_y = 0;
+						cmd.push_constants(&push, 0, sizeof(push));
+						cmd.dispatch(1, ny, 1);
+
+						if (nx > ix_end)
+						{
+							push.wg_offset_x = ix_end;
+							push.wg_offset_y = 0;
+							cmd.push_constants(&push, 0, sizeof(push));
+							cmd.dispatch(nx - ix_end, ny, 1);
+						}
+
+						push.wg_offset_x = 1;
+						push.wg_offset_y = 0;
+						cmd.push_constants(&push, 0, sizeof(push));
+						cmd.dispatch(ix_end - 1, 1, 1);
+
+						if (ny > iy_end)
+						{
+							push.wg_offset_x = 1;
+							push.wg_offset_y = iy_end;
+							cmd.push_constants(&push, 0, sizeof(push));
+							cmd.dispatch(ix_end - 1, ny - iy_end, 1);
+						}
+					}
+					else
+					{
+						cmd.set_specialization_constant(2, true);
+						cmd.set_specialization_constant(3, hf_mask);
+						cmd.set_specialization_constant(4, false);
+						cmd.set_specialization_constant(5, hf_mask != 0u);
+						push.wg_offset_x = 0;
+						push.wg_offset_y = 0;
+						cmd.push_constants(&push, 0, sizeof(push));
+						cmd.dispatch(nx, ny, 1);
+					}
+				}
+				else
+				{
+					cmd.set_specialization_constant(2, true);
+					cmd.set_specialization_constant(3, hf_mask);
+					cmd.set_specialization_constant(4, false);
+					cmd.set_specialization_constant(5, hf_mask != 0u);
+					push.wg_offset_x = 0;
+					push.wg_offset_y = 0;
+					cmd.push_constants(&push, 0, sizeof(push));
+					cmd.dispatch(nx, ny, 1);
+				}
+			}
+			else
+			{
+				cmd.set_specialization_constant_mask(final_output ? 3 : 0);
+				if (final_output)
+				{
+					cmd.set_specialization_constant(0, true);
+					cmd.set_specialization_constant(1, views.range_scale);
+				}
+				cmd.push_constants(&push, 0, 16);
+				cmd.set_texture(0, 0, *component_layer_views[c][input_level], *mirror_repeat_sampler);
+				cmd.dispatch(nx, ny, 1);
+			}
+		};
 
 		if (input_level == 0)
 		{
-			cmd.set_specialization_constant(0, true);
-			cmd.set_specialization_constant(1, views.range_scale);
 			if (chroma == ChromaSubsampling::Chroma444)
 			{
 				for (int c = 0; c < NumComponents; c++)
@@ -841,18 +1213,14 @@ bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 					char label[64];
 					snprintf(label, sizeof(label), "iDWT final, component %u", c);
 					cmd.begin_region(label);
-					cmd.set_storage_texture(0, 1, *views.planes[c]);
-					cmd.set_texture(0, 0, *component_layer_views[c][input_level], *mirror_repeat_sampler);
-					cmd.dispatch((push.resolution.x + 15) / 16, (push.resolution.y + 15) / 16, 1);
+					dispatch_component(c, true, *views.planes[c]);
 					cmd.end_region();
 				}
 			}
 			else
 			{
-				cmd.set_storage_texture(0, 1, *views.planes[0]);
 				cmd.begin_region("iDWT final");
-				cmd.set_texture(0, 0, *component_layer_views[0][input_level], *mirror_repeat_sampler);
-				cmd.dispatch((push.resolution.x + 15) / 16, (push.resolution.y + 15) / 16, 1);
+				dispatch_component(0, true, *views.planes[0]);
 				cmd.end_region();
 			}
 		}
@@ -860,21 +1228,13 @@ bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 		{
 			for (int c = 0; c < NumComponents; c++)
 			{
-				cmd.set_texture(0, 0, *component_layer_views[c][input_level], *mirror_repeat_sampler);
-
-				if (chroma == ChromaSubsampling::Chroma420 && c != 0 && input_level == 1)
-				{
-					cmd.set_storage_texture(0, 1, *views.planes[c]);
-					cmd.set_specialization_constant(0, true);
-					cmd.set_specialization_constant(1, views.range_scale);
-				}
-				else
-					cmd.set_storage_texture(0, 1, *component_ll_views[c][input_level - 1]);
+				const bool is_final_chroma = chroma == ChromaSubsampling::Chroma420 && c != 0 && input_level == 1;
+				const ImageView &dst = is_final_chroma ? *views.planes[c] : *component_ll_views[c][input_level - 1];
 
 				char label[64];
 				snprintf(label, sizeof(label), "iDWT level %u, component %u", input_level - 1, c);
 				cmd.begin_region(label);
-				cmd.dispatch((push.resolution.x + 15) / 16, (push.resolution.y + 15) / 16, 1);
+				dispatch_component(c, is_final_chroma, dst);
 				cmd.end_region();
 			}
 		}
@@ -978,6 +1338,8 @@ bool Decoder::Impl::decode_is_ready(bool allow_partial_frame) const
 
 bool Decoder::Impl::decode(CommandBuffer &cmd, const ViewBuffers &views)
 {
+	build_idwt_wg_lists();
+
 	if (use_uma_upload)
 	{
 		uma_slot = (uma_slot + 1) % kUmaRingSlots;
@@ -994,9 +1356,27 @@ bool Decoder::Impl::decode(CommandBuffer &cmd, const ViewBuffers &views)
 			                         dequant_offset_buffer_cpu.size() * sizeof(dequant_offset_buffer_cpu.front())),
 			       dequant_offset_buffer_cpu.data(), dequant_offset_buffer_cpu.size() * sizeof(dequant_offset_buffer_cpu.front()));
 
+			if (packed_2x2_wavelets && !wg_list_cpu.empty())
+			{
+				VkDeviceSize wg_size = wg_list_cpu.size() * sizeof(uint32_t);
+				if (!wg_list_buffer || wg_size > wg_list_buffer->get_create_info().size)
+				{
+					BufferCreateInfo wg_info;
+					wg_info.size = std::max<VkDeviceSize>(64 * 1024, wg_size * 2);
+					wg_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+					wg_info.domain = BufferDomain::Device;
+					wg_list_buffer = device->create_buffer(wg_info);
+					if (wg_list_buffer)
+						device->set_name(*wg_list_buffer, "idwt-wg-list");
+				}
+				if (wg_list_buffer)
+					memcpy(cmd.update_buffer(*wg_list_buffer, 0, wg_size), wg_list_cpu.data(), wg_size);
+			}
+
 			cmd.barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
 			            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-			            use_readonly_texel_buffer ? VK_ACCESS_2_SHADER_SAMPLED_READ_BIT : VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+			            VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+			            (use_readonly_texel_buffer ? VK_ACCESS_2_SHADER_SAMPLED_READ_BIT : 0));
 		}
 		cmd.end_region();
 	}
@@ -1004,11 +1384,11 @@ bool Decoder::Impl::decode(CommandBuffer &cmd, const ViewBuffers &views)
 	if (!dequant(cmd))
 		return false;
 
-	if (!use_uma_upload)
-		cmd.barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-
 	if (fragment_path)
 	{
+		if (!use_uma_upload)
+			cmd.barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+
 		if (!idwt_fragment(cmd, views))
 			return false;
 	}
@@ -1016,6 +1396,9 @@ bool Decoder::Impl::decode(CommandBuffer &cmd, const ViewBuffers &views)
 	{
 		if (!idwt(cmd, views))
 			return false;
+
+		if (!use_uma_upload)
+			cmd.barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
 	}
 
 	decoded_frame_for_current_sequence = true;
@@ -1025,6 +1408,7 @@ bool Decoder::Impl::decode(CommandBuffer &cmd, const ViewBuffers &views)
 void Decoder::Impl::clear()
 {
 	std::fill(dequant_offset_buffer_cpu.begin(), dequant_offset_buffer_cpu.end(), UINT32_MAX);
+	memset(active_band_mask, 0, sizeof(active_band_mask));
 	decoded_blocks = 0;
 	last_seq = UINT32_MAX;
 	decoded_frame_for_current_sequence = false;
@@ -1138,7 +1522,7 @@ bool Decoder::init(Vulkan::Device *device, int width, int height, ChromaSubsampl
 		return false;
 	}
 
-	if (!impl->init(device, width, height, chroma_, fragment_path_))
+	if (!impl->init(device, width, height, chroma_, fragment_path_, !fragment_path_))
 	{
 		LOGE("Failed to initialize.\n");
 		return false;

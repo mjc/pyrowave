@@ -156,11 +156,17 @@ private:
 
 struct WaveletBuffers
 {
-	bool init(Vulkan::Device *device, int width, int height, ChromaSubsampling chroma, bool fragment_path);
+	bool init(Vulkan::Device *device, int width, int height, ChromaSubsampling chroma, bool fragment_path,
+	          bool packed_2x2_wavelets = false);
+
+	uint32_t get_level_width(int level) const { return uint32_t(aligned_width >> (level + 1)); }
+	uint32_t get_level_height(int level) const { return uint32_t(aligned_height >> (level + 1)); }
+	bool level_is_packed_2x2(int level) const { return packed_2x2_wavelets && level < DecompositionLevels - 1; }
 
 	Vulkan::Device *device = nullptr;
 	Vulkan::ImageHandle wavelet_img_low_res;
 	Vulkan::ImageHandle wavelet_img_high_res;
+	Vulkan::ImageHandle wavelet_img_coarsest;
 	Vulkan::SamplerHandle mirror_repeat_sampler;
 	Vulkan::SamplerHandle border_sampler;
 	Vulkan::ImageViewHandle component_layer_views[NumComponents][DecompositionLevels];
@@ -207,6 +213,7 @@ struct WaveletBuffers
 	bool use_readonly_texel_buffer = false;
 	bool use_ssbo32_payload = false;
 	bool fragment_path = false;
+	bool packed_2x2_wavelets = false;
 
 protected:
 	void init_samplers();
