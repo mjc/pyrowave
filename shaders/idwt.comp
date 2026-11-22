@@ -158,11 +158,10 @@ void inverse_transform4x2(bool active_lane, int y_offset)
             values[i] -= ALPHA * (values[i - 1] + values[i + 1]);
     }
 
-    // Avoid WAR hazard.
-    barrier();
-
     if (active_lane)
     {
+        // Apron source rows and transposed destination rows are disjoint. The
+        // main transform's barrier already finished reads of these columns.
         for (int i = APRON_HALF; i < PADDED_SIZE_HALF - APRON_HALF; i++)
         {
             VEC2 a = values[2 * i + 0];
