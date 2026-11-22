@@ -19,6 +19,7 @@ struct DequantizerPushData
 	int32_t output_layer;
 	int32_t block_offset_32x32;
 	int32_t block_stride_32x32;
+	int32_t band_stride_32x32;
 };
 
 static bool supports_uma_upload(const Device &dev)
@@ -443,35 +444,34 @@ bool Decoder::Impl::dequant(CommandBuffer &cmd)
 			snprintf(label, sizeof(label), "level %d - component %d", level, component);
 			cmd.begin_region(label);
 
-			for (int band = (level == DecompositionLevels - 1 ? 0 : 1); band < 4; band++)
+			int first_band = level == DecompositionLevels - 1 ? 0 : 1;
+			push.resolution.x = wavelet_img_high_res->get_width(level);
+			push.resolution.y = wavelet_img_high_res->get_height(level);
+			push.output_layer = first_band;
+			push.block_offset_32x32 = block_meta[component][level][first_band].block_offset_32x32;
+			push.block_stride_32x32 = block_meta[component][level][first_band].block_stride_32x32;
+			push.band_stride_32x32 = block_meta[component][level][first_band].block_count_32x32;
+			cmd.push_constants(&push, 0, sizeof(push));
+
+			cmd.set_storage_texture(0, 0, *component_layer_views[component][level]);
+			cmd.set_storage_buffer(0, 1, *active_dequant_offset);
+
+			if (payload_r8_image && payload_r16_image && payload_r32_image)
 			{
-				push.resolution.x = wavelet_img_high_res->get_width(level);
-				push.resolution.y = wavelet_img_high_res->get_height(level);
-				push.output_layer = band;
-				push.block_offset_32x32 = block_meta[component][level][band].block_offset_32x32;
-				push.block_stride_32x32 = block_meta[component][level][band].block_stride_32x32;
-				cmd.push_constants(&push, 0, sizeof(push));
-
-				cmd.set_storage_texture(0, 0, *component_layer_views[component][level]);
-				cmd.set_storage_buffer(0, 1, *active_dequant_offset);
-
-				if (payload_r8_image && payload_r16_image && payload_r32_image)
-				{
-					cmd.set_texture(0, 2, payload_r32_image->get_view());
-					cmd.set_texture(0, 3, payload_r16_image->get_view());
-					cmd.set_texture(0, 4, payload_r8_image->get_view());
-				}
-				else if (use_readonly_texel_buffer)
-				{
-					cmd.set_buffer_view(0, 2, *payload_u32_view);
-					cmd.set_buffer_view(0, 3, *payload_u16_view);
-					cmd.set_buffer_view(0, 4, *payload_u8_view);
-				}
-				else
-					cmd.set_storage_buffer(0, 2, *active_payload_data);
-
-				cmd.dispatch((push.resolution.x + 31) / 32, (push.resolution.y + 31) / 32, 1);
+				cmd.set_texture(0, 2, payload_r32_image->get_view());
+				cmd.set_texture(0, 3, payload_r16_image->get_view());
+				cmd.set_texture(0, 4, payload_r8_image->get_view());
 			}
+			else if (use_readonly_texel_buffer)
+			{
+				cmd.set_buffer_view(0, 2, *payload_u32_view);
+				cmd.set_buffer_view(0, 3, *payload_u16_view);
+				cmd.set_buffer_view(0, 4, *payload_u8_view);
+			}
+			else
+				cmd.set_storage_buffer(0, 2, *active_payload_data);
+
+			cmd.dispatch((push.resolution.x + 31) / 32, (push.resolution.y + 31) / 32, 4 - first_band);
 
 			cmd.end_region();
 		}
