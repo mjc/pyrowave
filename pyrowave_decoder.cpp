@@ -1558,7 +1558,17 @@ bool Decoder::init(Vulkan::Device *device, int width, int height, ChromaSubsampl
 		return false;
 	}
 
-	if (!impl->init(device, width, height, chroma_, fragment_path_, !fragment_path_))
+	// 2x2 RGBA packed wavelets + sparse iDWT workgroup classification is a ~2x win on
+	// NVIDIA/Tegra, whereas Apple Silicon / MoltenVK is ~14% faster on hardware textureGather
+	// iDWT; disable packed wavelets on MoltenVK and Apple GPUs.
+	const auto driver_id = device->get_device_features().driver_id;
+	const auto vendor_id = device->get_gpu_properties().vendorID;
+	const bool use_packed_wavelets =
+		!fragment_path_ &&
+		driver_id != VK_DRIVER_ID_MOLTENVK &&
+		vendor_id != 0x106Bu; // Apple
+
+	if (!impl->init(device, width, height, chroma_, fragment_path_, use_packed_wavelets))
 	{
 		LOGE("Failed to initialize.\n");
 		return false;
