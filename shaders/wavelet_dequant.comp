@@ -122,8 +122,10 @@ uint read_payload_u32(uint word_offset)
 }
 #endif
 
-mat2x4 decode_payload(uint code_word, uint q_bits, uint offset, uint block_index)
+mat2x4 decode_payload(uint code_word, uint q_bits, uint offset, uint block_index,
+                     out uint significant_mask)
 {
+    significant_mask = 0;
     bool empty_block = code_word == 0;
     if (empty_block)
         return mat2x4(vec4(0.0), vec4(0.0));
@@ -154,6 +156,7 @@ mat2x4 decode_payload(uint code_word, uint q_bits, uint offset, uint block_index
     for (int q = plane_iterations - 1; q >= 0; q--)
     {
         uint payload = word & 0xffu;
+        significant_mask |= payload;
         for (int b = 0; b < 8; b++)
         {
             int decoded = int(bitfieldExtract(payload, b, 1));
@@ -180,6 +183,7 @@ mat2x4 decode_payload(uint code_word, uint q_bits, uint offset, uint block_index
 
     for (int q = plane_iterations - 1; q >= 0; q--)
     {
+        significant_mask |= payload;
         for (int b = 0; b < 8; b++)
         {
             int decoded = int(bitfieldExtract(payload, b, 1));
@@ -371,7 +375,7 @@ void main()
     barrier();
 
     mat2x4 v;
-    int significant_count;
+    uint significant_mask;
 
     if (bitfieldExtract(ballot, int(linear_block), 1) != 0)
     {
@@ -379,12 +383,7 @@ void main()
         uint control_word2 = shared_control_word2[linear_block];
 
         v = decode_payload(control_word, control_word2 & 0xfu,
-            shared_plane_byte_offsets[linear_block], block_local_index);
-
-        significant_count = 0;
-        for (int j = 0; j < 2; j++)
-            for (int i = 0; i < 4; i++)
-                significant_count += int(v[j][i] != 0.0);
+            shared_plane_byte_offsets[linear_block], block_local_index, significant_mask);
 
         float q = decode_quant(q_code);
         float inv_scale = q * decode_quant_scale(bitfieldExtract(control_word2, QUANT_SCALE_OFFSET - 16, QUANT_SCALE_BITS));
@@ -394,9 +393,12 @@ void main()
     else
     {
         v = mat2x4(vec4(0.0), vec4(0.0));
-        significant_count = 0;
+        significant_mask = 0;
     }
 
+    // Each bitplane bit maps to one coefficient. Their union identifies the
+    // nonzero coefficients without scanning the reconstructed floats.
+    int significant_count = bitCount(significant_mask);
     // Figure out how many significant coefficients we have.
     int significant_scan = subgroupInclusiveAdd(significant_count);
     if (gl_SubgroupInvocationID == gl_SubgroupSize - 1)
@@ -455,11 +457,10 @@ void main()
         {
             for (int j = 0; j < 2; j++)
             {
-                if (v[j][i] != 0.0)
-                {
-                    v[j][i] *= 1.0 - 2.0 * float(bitfieldExtract(sign_word, sign_counter, 1));
-                    sign_counter++;
-                }
+                uint nonzero = bitfieldExtract(significant_mask, 2 * i + j, 1);
+                uint sign = bitfieldExtract(sign_word, sign_counter, 1) & nonzero;
+                v[j][i] = uintBitsToFloat(floatBitsToUint(v[j][i]) ^ (sign << 31));
+                sign_counter += int(nonzero);
             }
         }
     }
