@@ -2,6 +2,7 @@
 // Copyright (c) 2025 Hans-Kristian Arntzen
 // SPDX-License-Identifier: MIT
 
+#extension GL_EXT_control_flow_attributes : require
 #if FP16
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #endif
@@ -23,13 +24,18 @@ layout(push_constant) uniform Registers
     vec2 inv_resolution;
 };
 
-vec2 generate_mirror_uv(ivec2 coord, bool even_x, bool even_y)
+void gather_2x2(ivec2 coord, out VEC4 texels0, out VEC4 texels1, out VEC4 texels2, out VEC4 texels3)
 {
-    coord -= ivec2(band(bvec2(even_x, even_y), lessThan(coord, ivec2(0))));
-    coord += 1;
-    coord += ivec2(band(bvec2(!even_x, !even_y), greaterThanEqual(coord, resolution)));
-    vec2 uv = vec2(coord) * inv_resolution;
-    return uv.yx; // Transpose on load.
+    ivec2 coord_even = (coord - ivec2(lessThan(coord, ivec2(0)))) + 1;
+    ivec2 coord_odd = (coord + 1) + ivec2(greaterThanEqual(coord + 1, resolution));
+    vec2 uv_even = vec2(coord_even) * inv_resolution;
+    vec2 uv_odd = vec2(coord_odd) * inv_resolution;
+
+    // Transpose on load.
+    texels0 = VEC4(textureGather(uTexture, vec3(uv_even.y, uv_even.x, 0.0), 0)).wxzy;
+    texels1 = VEC4(textureGather(uTexture, vec3(uv_even.y, uv_odd.x, 2.0), 0)).wxzy;
+    texels2 = VEC4(textureGather(uTexture, vec3(uv_odd.y, uv_even.x, 1.0), 0)).wxzy;
+    texels3 = VEC4(textureGather(uTexture, vec3(uv_odd.y, uv_odd.x, 3.0), 0)).wxzy;
 }
 
 void write_shared_4x4(ivec2 coord, VEC4 texels0, VEC4 texels1, VEC4 texels2, VEC4 texels3)
@@ -48,70 +54,67 @@ void load_image_with_apron()
 {
     ivec2 base_coord = ivec2(gl_WorkGroupID.xy) * ivec2(BLOCK_SIZE_HALF) - APRON_HALF;
     ivec2 local_coord0 = 2 * unswizzle8x8(local_index);
-    ivec2 coord0 = base_coord + local_coord0;
 
-    // Transpose on load.
-    VEC4 texels0 = VEC4(textureGather(uTexture, vec3(generate_mirror_uv(coord0, true, true), 0.0), 0)).wxzy;
-    VEC4 texels1 = VEC4(textureGather(uTexture, vec3(generate_mirror_uv(coord0, false, true), 2.0), 0)).wxzy;
-    VEC4 texels2 = VEC4(textureGather(uTexture, vec3(generate_mirror_uv(coord0, true, false), 1.0), 0)).wxzy;
-    VEC4 texels3 = VEC4(textureGather(uTexture, vec3(generate_mirror_uv(coord0, false, false), 3.0), 0)).wxzy;
+    VEC4 texels0, texels1, texels2, texels3;
+    gather_2x2(base_coord + local_coord0, texels0, texels1, texels2, texels3);
     write_shared_4x4(local_coord0, texels0, texels1, texels2, texels3);
 
-    ivec2 local_coord_horiz = ivec2(BLOCK_SIZE_HALF + 2 * (local_index % 2u), 2 * (local_index / 2u));
-    if (local_coord_horiz.y < BLOCK_SIZE_HALF + 2 * APRON_HALF)
+    // Pack the 20 right-apron (including corner) and 16 bottom-apron gathers
+    // into one branch so warp 0 runs fully occupied instead of two narrow waves.
+    if (local_index < 36u)
     {
-        texels0 = VEC4(textureGather(uTexture, vec3(generate_mirror_uv(base_coord + local_coord_horiz, true, true), 0.0), 0)).wxzy;
-        texels1 = VEC4(textureGather(uTexture, vec3(generate_mirror_uv(base_coord + local_coord_horiz, false, true), 2.0), 0)).wxzy;
-        texels2 = VEC4(textureGather(uTexture, vec3(generate_mirror_uv(base_coord + local_coord_horiz, true, false), 1.0), 0)).wxzy;
-        texels3 = VEC4(textureGather(uTexture, vec3(generate_mirror_uv(base_coord + local_coord_horiz, false, false), 3.0), 0)).wxzy;
-        write_shared_4x4(local_coord_horiz, texels0, texels1, texels2, texels3);
-    }
+        ivec2 local_coord;
+        if (local_index < 20u)
+        {
+            local_coord = ivec2(BLOCK_SIZE_HALF + 2 * int(local_index & 1u), 2 * int(local_index >> 1));
+        }
+        else
+        {
+            uint idx = local_index - 20u;
+            local_coord = ivec2(2 * int(idx >> 1), BLOCK_SIZE_HALF + 2 * int(idx & 1u));
+        }
 
-    ivec2 local_coord_vert = local_coord_horiz.yx;
-    if (local_coord_vert.x < BLOCK_SIZE_HALF)
-    {
-        texels0 = VEC4(textureGather(uTexture, vec3(generate_mirror_uv(base_coord + local_coord_vert, true, true), 0.0), 0)).wxzy;
-        texels1 = VEC4(textureGather(uTexture, vec3(generate_mirror_uv(base_coord + local_coord_vert, false, true), 2.0), 0)).wxzy;
-        texels2 = VEC4(textureGather(uTexture, vec3(generate_mirror_uv(base_coord + local_coord_vert, true, false), 1.0), 0)).wxzy;
-        texels3 = VEC4(textureGather(uTexture, vec3(generate_mirror_uv(base_coord + local_coord_vert, false, false), 3.0), 0)).wxzy;
-        write_shared_4x4(local_coord_vert, texels0, texels1, texels2, texels3);
+        gather_2x2(base_coord + local_coord, texels0, texels1, texels2, texels3);
+        write_shared_4x4(local_coord, texels0, texels1, texels2, texels3);
     }
 
     barrier();
 }
 
-void inverse_transform8x2()
+// Element 0 is never read by any CDF 9/7 inverse lifting step (only indices 1..PADDED_SIZE-1 are).
+#define LOAD_AND_INVERSE_LIFT_97(values, local_coord, PADDED_SIZE) \
+    values[1] = load_shared((local_coord).y, (local_coord).x + 1) * inv_K; \
+    [[unroll]] for (int i = 2; i < (PADDED_SIZE); i += 2) \
+    { \
+        VEC2 v0 = load_shared((local_coord).y, (local_coord).x + i + 0); \
+        VEC2 v1 = load_shared((local_coord).y, (local_coord).x + i + 1); \
+        values[i + 0] = v0 * K; \
+        values[i + 1] = v1 * inv_K; \
+    } \
+    [[unroll]] for (int i = 2; i < (PADDED_SIZE) - 1; i += 2) \
+        values[i] -= DELTA * (values[i - 1] + values[i + 1]); \
+    [[unroll]] for (int i = 3; i < (PADDED_SIZE) - 2; i += 2) \
+        values[i] -= GAMMA * (values[i - 1] + values[i + 1]); \
+    [[unroll]] for (int i = 4; i < (PADDED_SIZE) - 3; i += 2) \
+        values[i] -= BETA * (values[i - 1] + values[i + 1]); \
+    [[unroll]] for (int i = 5; i < (PADDED_SIZE) - 4; i += 2) \
+        values[i] -= ALPHA * (values[i - 1] + values[i + 1])
+
+void load_and_lift_8x2(ivec2 local_coord, out VEC2 out_values[8])
 {
     const int SIZE = 8;
     const int PADDED_SIZE = SIZE + 2 * APRON;
-    const int PADDED_SIZE_HALF = PADDED_SIZE / 2;
     VEC2 values[PADDED_SIZE];
 
-    ivec2 local_coord = ivec2(8 * (local_index % 4u), local_index / 4u);
+    LOAD_AND_INVERSE_LIFT_97(values, local_coord, PADDED_SIZE);
 
-    for (int i = 0; i < PADDED_SIZE; i += 2)
-    {
-        VEC2 v0 = load_shared(local_coord.y, local_coord.x + i + 0);
-        VEC2 v1 = load_shared(local_coord.y, local_coord.x + i + 1);
-        values[i + 0] = v0 * K;
-        values[i + 1] = v1 * inv_K;
-    }
+    [[unroll]] for (int i = 0; i < SIZE; i++)
+        out_values[i] = values[2 * APRON_HALF + i];
+}
 
-    // CDF 9/7 lifting steps.
-    // Arith go brrr.
-    for (int i = 2; i < PADDED_SIZE - 1; i += 2)
-        values[i] -= DELTA * (values[i - 1] + values[i + 1]);
-    for (int i = 3; i < PADDED_SIZE - 2; i += 2)
-        values[i] -= GAMMA * (values[i - 1] + values[i + 1]);
-    for (int i = 4; i < PADDED_SIZE - 3; i += 2)
-        values[i] -= BETA * (values[i - 1] + values[i + 1]);
-    for (int i = 5; i < PADDED_SIZE - 4; i += 2)
-        values[i] -= ALPHA * (values[i - 1] + values[i + 1]);
-
-    // Avoid WAR hazard.
-    barrier();
-
-    for (int i = APRON_HALF; i < PADDED_SIZE_HALF - APRON_HALF; i++)
+void store_transposed_8x2(ivec2 local_coord, VEC2 values[8])
+{
+    [[unroll]] for (int i = 0; i < 4; i++)
     {
         VEC2 a = values[2 * i + 0];
         VEC2 b = values[2 * i + 1];
@@ -121,62 +124,35 @@ void inverse_transform8x2()
         VEC2 t1 = VEC2(a.y, b.y);
 
         // Transpose write
-        int y_coord = (local_coord.x >> 1) + (i - APRON_HALF);
+        int y_coord = (local_coord.x >> 1) + i;
         store_shared(y_coord, 2 * local_coord.y + 0, t0);
         store_shared(y_coord, 2 * local_coord.y + 1, t1);
     }
 }
 
-void inverse_transform4x2(bool active_lane, int y_offset)
+void inverse_transform4x2_no_barrier(int y_offset)
 {
     const int SIZE = 4;
     const int PADDED_SIZE = SIZE + 2 * APRON;
-    const int PADDED_SIZE_HALF = PADDED_SIZE / 2;
     VEC2 values[PADDED_SIZE];
 
     ivec2 local_coord = ivec2(4 * (local_index % 8u), local_index / 8u + y_offset);
 
-    if (active_lane)
+    LOAD_AND_INVERSE_LIFT_97(values, local_coord, PADDED_SIZE);
+
+    [[unroll]] for (int i = 0; i < 2; i++)
     {
-        for (int i = 0; i < PADDED_SIZE; i += 2)
-        {
-            VEC2 v0 = load_shared(local_coord.y, local_coord.x + i + 0);
-            VEC2 v1 = load_shared(local_coord.y, local_coord.x + i + 1);
-            values[i + 0] = v0 * K;
-            values[i + 1] = v1 * inv_K;
-        }
+        VEC2 a = values[2 * APRON_HALF + 2 * i + 0];
+        VEC2 b = values[2 * APRON_HALF + 2 * i + 1];
 
-        // CDF 9/7 lifting steps.
-        // Arith go brrr.
-        for (int i = 2; i < PADDED_SIZE - 1; i += 2)
-            values[i] -= DELTA * (values[i - 1] + values[i + 1]);
-        for (int i = 3; i < PADDED_SIZE - 2; i += 2)
-            values[i] -= GAMMA * (values[i - 1] + values[i + 1]);
-        for (int i = 4; i < PADDED_SIZE - 3; i += 2)
-            values[i] -= BETA * (values[i - 1] + values[i + 1]);
-        for (int i = 5; i < PADDED_SIZE - 4; i += 2)
-            values[i] -= ALPHA * (values[i - 1] + values[i + 1]);
-    }
+        // Transpose the 2x2 block.
+        VEC2 t0 = VEC2(a.x, b.x);
+        VEC2 t1 = VEC2(a.y, b.y);
 
-    // Avoid WAR hazard.
-    barrier();
-
-    if (active_lane)
-    {
-        for (int i = APRON_HALF; i < PADDED_SIZE_HALF - APRON_HALF; i++)
-        {
-            VEC2 a = values[2 * i + 0];
-            VEC2 b = values[2 * i + 1];
-
-            // Transpose the 2x2 block.
-            VEC2 t0 = VEC2(a.x, b.x);
-            VEC2 t1 = VEC2(a.y, b.y);
-
-            // Transpose write
-            int y_coord = (local_coord.x >> 1) + (i - APRON_HALF);
-            store_shared(y_coord, 2 * local_coord.y + 0, t0);
-            store_shared(y_coord, 2 * local_coord.y + 1, t1);
-        }
+        // Transpose write
+        int y_coord = (local_coord.x >> 1) + i;
+        store_shared(y_coord, 2 * local_coord.y + 0, t0);
+        store_shared(y_coord, 2 * local_coord.y + 1, t1);
     }
 }
 
@@ -186,32 +162,49 @@ void main()
 
     load_image_with_apron();
 
-    // Horizontal transform.
-    inverse_transform8x2();
+    ivec2 local_coord = ivec2(8 * (local_index % 4u), local_index / 4u);
 
-    // Also need to transform the apron.
-    inverse_transform4x2(local_index < 32, BLOCK_SIZE_HALF);
+    // Horizontal transform: 8x2 reads rows 0..15, writes [0..15][0..31];
+    // 4x2 reads rows 16..19, writes [0..15][32..39]. After the 8x2 read barrier,
+    // [0..15][32..39] is dead and [16..19] is untouched, so 4x2 needs no barrier.
+    VEC2 h_vals[8];
+    load_and_lift_8x2(local_coord, h_vals);
+
+    // Avoid WAR hazard for rows 0..15.
+    barrier();
+
+    store_transposed_8x2(local_coord, h_vals);
+
+    if (local_index < 32u)
+        inverse_transform4x2_no_barrier(BLOCK_SIZE_HALF);
 
     barrier();
 
-    // Vertical transform.
-    inverse_transform8x2();
+    // Vertical transform writes directly to uOutput, avoiding a final shared
+    // round-trip and barrier.
+    VEC2 v_vals[8];
+    load_and_lift_8x2(local_coord, v_vals);
 
-    barrier();
-
-    ivec2 local_coord = unswizzle8x8(local_index);
-
-    for (int y = local_coord.y; y < BLOCK_SIZE_HALF; y += 8)
+    ivec2 out_base = BLOCK_SIZE * ivec2(gl_WorkGroupID.yx);
+    [[unroll]] for (int i = 0; i < 4; i++)
     {
-        for (int x = local_coord.x; x < BLOCK_SIZE; x += 8)
+        VEC2 a = v_vals[2 * i + 0];
+        VEC2 b = v_vals[2 * i + 1];
+        if (DCShift)
         {
-            VEC2 v = load_shared(y, x);
-            if (DCShift)
-                v += FLOAT(0.5);
-			if (RangeScale != 1.0)
-				v = clamp(v, FLOAT(0.0), FLOAT(1.0)) * FLOAT(RangeScale);
-            imageStore(uOutput, ivec2(2 * y + 0, x) + BLOCK_SIZE * ivec2(gl_WorkGroupID.yx), v.xxxx);
-            imageStore(uOutput, ivec2(2 * y + 1, x) + BLOCK_SIZE * ivec2(gl_WorkGroupID.yx), v.yyyy);
+            a += FLOAT(0.5);
+            b += FLOAT(0.5);
         }
+        if (RangeScale != 1.0)
+        {
+            a = clamp(a, FLOAT(0.0), FLOAT(1.0)) * FLOAT(RangeScale);
+            b = clamp(b, FLOAT(0.0), FLOAT(1.0)) * FLOAT(RangeScale);
+        }
+        int out_x = local_coord.x + 2 * i;
+        int out_y = 2 * local_coord.y;
+        imageStore(uOutput, out_base + ivec2(out_x + 0, out_y + 0), a.xxxx);
+        imageStore(uOutput, out_base + ivec2(out_x + 1, out_y + 0), b.xxxx);
+        imageStore(uOutput, out_base + ivec2(out_x + 0, out_y + 1), a.yyyy);
+        imageStore(uOutput, out_base + ivec2(out_x + 1, out_y + 1), b.yyyy);
     }
 }

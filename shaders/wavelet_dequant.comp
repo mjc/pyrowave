@@ -41,10 +41,17 @@ layout(set = 0, binding = 2) readonly buffer Payloads8
 layout(set = 0, binding = 2) uniform usamplerBuffer PayloadU32;
 layout(set = 0, binding = 3) uniform mediump usamplerBuffer PayloadU16;
 layout(set = 0, binding = 4) uniform mediump usamplerBuffer PayloadU8;
-#else
+#elif STORAGE_MODE == 2
 layout(set = 0, binding = 2) uniform utexture2D PayloadU32;
 layout(set = 0, binding = 3) uniform mediump utexture2D PayloadU16;
 layout(set = 0, binding = 4) uniform mediump utexture2D PayloadU8;
+#elif STORAGE_MODE == 3
+layout(set = 0, binding = 2) readonly buffer Payloads
+{
+    uint data[];
+} payload_data_u32;
+#else
+#error "Invalid STORAGE_MODE"
 #endif
 
 #include "dwt_swizzle.h"
@@ -60,19 +67,19 @@ layout(push_constant) uniform Registers
 } registers;
 
 #if STORAGE_MODE == 1
-uint read_payload_u8(int coord)
+uint read_payload_u8(uint coord)
 {
-	return texelFetch(PayloadU8, coord).x;
+	return texelFetch(PayloadU8, int(coord)).x;
 }
 
-uint read_payload_u16(int coord)
+uint read_payload_u16(uint coord)
 {
-	return texelFetch(PayloadU16, coord).x;
+	return texelFetch(PayloadU16, int(coord)).x;
 }
 
-uint read_payload_u32(int coord)
+uint read_payload_u32(uint coord)
 {
-	return texelFetch(PayloadU32, coord).x;
+	return texelFetch(PayloadU32, int(coord)).x;
 }
 #elif STORAGE_MODE == 2
 uint read_payload_u8(uint coord)
@@ -95,6 +102,23 @@ uint read_payload_u32(uint coord)
 	uint y = bitfieldExtract(coord, 10, 22);
 	return texelFetch(PayloadU32, ivec2(x, y), 0).x;
 }
+#elif STORAGE_MODE == 3
+uint read_payload_u8(uint byte_offset)
+{
+	uint word = payload_data_u32.data[byte_offset >> 2];
+	return bitfieldExtract(word, int((byte_offset & 3u) << 3), 8);
+}
+
+uint read_payload_u16(uint half_offset)
+{
+	uint word = payload_data_u32.data[half_offset >> 1];
+	return bitfieldExtract(word, int((half_offset & 1u) << 4), 16);
+}
+
+uint read_payload_u32(uint word_offset)
+{
+	return payload_data_u32.data[word_offset];
+}
 #endif
 
 mat2x4 decode_payload(uint code_word, uint q_bits, uint offset, uint block_index)
@@ -104,6 +128,10 @@ mat2x4 decode_payload(uint code_word, uint q_bits, uint offset, uint block_index
         return mat2x4(vec4(0.0), vec4(0.0));
 
     int bit_offset = 2 * int(block_index);
+    uint local_control_word = bitfieldExtract(code_word, bit_offset, 2);
+    int plane_iterations = int(q_bits + local_control_word);
+    if (plane_iterations == 0)
+        return mat2x4(vec4(0.0), vec4(0.0));
 
     // First, we need to compute the offset that our 4x2 block starts on.
     uint lsbs = code_word & 0x5555u;
@@ -116,17 +144,38 @@ mat2x4 decode_payload(uint code_word, uint q_bits, uint offset, uint block_index
         bitCount(bitfieldExtract(msbs, 0, bit_offset)) +
         q_bits * block_index + offset;
 
+    int decoded_abs[8] = int[8](0, 0, 0, 0, 0, 0, 0, 0);
+
+#if STORAGE_MODE == 3
+    // Stream bytes from a cached 32-bit word to avoid reloading on every bitplane byte.
+    uint word = payload_data_u32.data[byte_offset >> 2] >> ((byte_offset & 3u) << 3);
+
+    for (int q = plane_iterations - 1; q >= 0; q--)
+    {
+        uint payload = word & 0xffu;
+        for (int b = 0; b < 8; b++)
+        {
+            int decoded = int(bitfieldExtract(payload, b, 1));
+            decoded_abs[b] = bitfieldInsert(decoded_abs[b], decoded, q, 1);
+        }
+
+        if (q > 0)
+        {
+            byte_offset++;
+            if ((byte_offset & 3u) == 0u)
+                word = payload_data_u32.data[byte_offset >> 2];
+            else
+                word >>= 8;
+        }
+    }
+#else
 #if STORAGE_MODE == 0
     // Eagerly load the data to keep latency down.
     // Also forces the descriptor to be loaded early.
     uint payload = uint(payload_data_u8.data[byte_offset]);
 #else
-	uint payload = read_payload_u8(int(byte_offset));
+    uint payload = read_payload_u8(byte_offset);
 #endif
-
-    uint local_control_word = bitfieldExtract(code_word, bit_offset, 2);
-    int decoded_abs[8] = int[8](0, 0, 0, 0, 0, 0, 0, 0);
-    int plane_iterations = int(q_bits + local_control_word);
 
     for (int q = plane_iterations - 1; q >= 0; q--)
     {
@@ -135,13 +184,18 @@ mat2x4 decode_payload(uint code_word, uint q_bits, uint offset, uint block_index
             int decoded = int(bitfieldExtract(payload, b, 1));
             decoded_abs[b] = bitfieldInsert(decoded_abs[b], decoded, q, 1);
         }
-        byte_offset++;
+
+        if (q > 0)
+        {
+            byte_offset++;
 #if STORAGE_MODE == 0
-        payload = uint(payload_data_u8.data[byte_offset]);
+            payload = uint(payload_data_u8.data[byte_offset]);
 #else
-        payload = read_payload_u8(int(byte_offset));
+            payload = read_payload_u8(byte_offset);
 #endif
+        }
     }
+#endif
 
     mat2x4 m;
 
@@ -162,6 +216,8 @@ mat2x4 decode_payload(uint code_word, uint q_bits, uint offset, uint block_index
 shared uint shared_sign_offset;
 shared uint shared_plane_byte_offsets[16];
 shared uint shared_plane_byte_costs[16];
+shared uint shared_control_word[16];
+shared uint shared_control_word2[16];
 shared uint shared_sign_scan[128 / 4];
 
 const int MaxScaleExp = 4;
@@ -248,31 +304,35 @@ void main()
         return;
     }
 
-#if STORAGE_MODE == 0
-    uint ballot = payload_data_u32.data[offset_u32] & 0xffff;
-    uint q_code = payload_data_u32.data[offset_u32 + 1] & 0xff;
+#if STORAGE_MODE == 0 || STORAGE_MODE == 3
+    uint ballot = payload_data_u32.data[offset_u32] & 0xffffu;
+    uint q_code = payload_data_u32.data[offset_u32 + 1] & 0xffu;
 #else
-    uint ballot = read_payload_u16(2 * int(offset_u32));
-    uint q_code = read_payload_u8(4 * int(offset_u32) + 4);
+    uint ballot = read_payload_u16(2 * offset_u32);
+    uint q_code = read_payload_u8(4 * offset_u32 + 4);
 #endif
 
     if (local_index < 16)
     {
         uint control_word = 0;
-        uint q_bits = 0;
+        uint control_word2 = 0;
 
         if (bitfieldExtract(ballot, int(local_index), 1) != 0)
         {
             uint local_code_offset = bitCount(bitfieldExtract(ballot, 0, int(local_index)));
 #if STORAGE_MODE == 0
             control_word = uint(payload_data_u16.data[offset_u32 * 2 + 4 + local_code_offset]);
-            q_bits = uint(payload_data_u8.data[offset_u32 * 4 + 8 + bitCount(ballot) * 2 + local_code_offset]) & 0xfu;
+            control_word2 = uint(payload_data_u8.data[offset_u32 * 4 + 8 + bitCount(ballot) * 2 + local_code_offset]);
 #else
-            control_word = read_payload_u16(int(offset_u32 * 2 + 4 + local_code_offset));
-            q_bits = read_payload_u8(int(offset_u32 * 4 + 8 + bitCount(ballot) * 2 + local_code_offset)) & 0xfu;
+            control_word = read_payload_u16(offset_u32 * 2 + 4 + local_code_offset);
+            control_word2 = read_payload_u8(offset_u32 * 4 + 8 + bitCount(ballot) * 2 + local_code_offset);
 #endif
         }
 
+        shared_control_word[local_index] = control_word;
+        shared_control_word2[local_index] = control_word2;
+
+        uint q_bits = control_word2 & 0xfu;
         uint lsbs = control_word & 0x5555u;
         uint msbs = control_word & 0xaaaau;
         uint msbs_shift = msbs >> 1;
@@ -312,15 +372,8 @@ void main()
 
     if (bitfieldExtract(ballot, int(linear_block), 1) != 0)
     {
-        uint local_code_offset = bitCount(bitfieldExtract(ballot, 0, int(linear_block)));
-
-#if STORAGE_MODE == 0
-        uint control_word = uint(payload_data_u16.data[offset_u32 * 2 + 4 + local_code_offset]);
-        uint control_word2 = uint(payload_data_u8.data[offset_u32 * 4 + 8 + bitCount(ballot) * 2 + local_code_offset]);
-#else
-        uint control_word = read_payload_u16(int(offset_u32 * 2 + 4 + local_code_offset));
-        uint control_word2 = read_payload_u8(int(offset_u32 * 4 + 8 + bitCount(ballot) * 2 + local_code_offset));
-#endif
+        uint control_word = shared_control_word[linear_block];
+        uint control_word2 = shared_control_word2[linear_block];
 
         v = decode_payload(control_word, control_word2 & 0xfu,
             shared_plane_byte_offsets[linear_block], block_local_index);
@@ -368,39 +421,42 @@ void main()
         scan_subgroups_fallback(local_index);
     }
 
-    // Compute where we need to start reading sign bits from.
-    uint sign_offset = shared_sign_offset + significant_scan - significant_count;
-    if (gl_SubgroupID != 0)
-        sign_offset += shared_sign_scan[gl_SubgroupID - 1];
+    if (significant_count != 0)
+    {
+        // Compute where we need to start reading sign bits from.
+        uint sign_offset = shared_sign_offset + significant_scan - significant_count;
+        if (gl_SubgroupID != 0)
+            sign_offset += shared_sign_scan[gl_SubgroupID - 1];
 
-    // Read out all sign bits we could possibly access per thread.
-    // On AMD at least, this 64-bit load should be vectorizable.
+        // Read out all sign bits we could possibly access per thread.
+        // On AMD at least, this 64-bit load should be vectorizable.
 #if STORAGE_MODE == 0
-    uint sign_word = payload_data_u32.data[sign_offset / 32 + 0];
-    uint sign_word_upper = payload_data_u32.data[sign_offset / 32 + 1];
+        uint sign_word = payload_data_u32.data[sign_offset / 32 + 0];
+        uint sign_word_upper = payload_data_u32.data[sign_offset / 32 + 1];
 #else
-    uint sign_word = read_payload_u32(int(sign_offset / 32 + 0));
-    uint sign_word_upper = read_payload_u32(int(sign_offset / 32 + 1));
+        uint sign_word = read_payload_u32(sign_offset / 32 + 0);
+        uint sign_word_upper = read_payload_u32(sign_offset / 32 + 1);
 #endif
 
-    uint masked_sign_offset = sign_offset & 31u;
-    if (masked_sign_offset != 0)
-    {
-        sign_word >>= masked_sign_offset;
-        sign_word |= sign_word_upper << (32 - masked_sign_offset);
-    }
-
-    int sign_counter = 0;
-
-    // Clock out the sign bits as needed.
-    for (int i = 0; i < 4; i++)
-    {
-        for (int j = 0; j < 2; j++)
+        uint masked_sign_offset = sign_offset & 31u;
+        if (masked_sign_offset != 0)
         {
-            if (v[j][i] != 0.0)
+            sign_word >>= masked_sign_offset;
+            sign_word |= sign_word_upper << (32 - masked_sign_offset);
+        }
+
+        int sign_counter = 0;
+
+        // Clock out the sign bits as needed.
+        for (int i = 0; i < 4; i++)
+        {
+            for (int j = 0; j < 2; j++)
             {
-                v[j][i] *= 1.0 - 2.0 * float(bitfieldExtract(sign_word, sign_counter, 1));
-                sign_counter++;
+                if (v[j][i] != 0.0)
+                {
+                    v[j][i] *= 1.0 - 2.0 * float(bitfieldExtract(sign_word, sign_counter, 1));
+                    sign_counter++;
+                }
             }
         }
     }
