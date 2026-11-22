@@ -48,7 +48,7 @@ struct Decoder::Impl final : public WaveletBuffers
 {
 	static constexpr uint32_t kUmaRingSlots = 4;
 
-	BufferHandle dequant_offset_buffer, payload_data, wg_list_buffer;
+	BufferHandle dequant_offset_buffer, payload_data, edge_wg_list_buffer;
 	BufferViewHandle payload_u32_view, payload_u16_view, payload_u8_view;
 
 	// Ring-buffered zero-copy UMA upload buffers (used when !use_readonly_texel_buffer and UMA heap is present).
@@ -56,7 +56,6 @@ struct Decoder::Impl final : public WaveletBuffers
 	uint32_t uma_slot = 0;
 	BufferHandle uma_dequant_offset[kUmaRingSlots];
 	BufferHandle uma_payload_data[kUmaRingSlots];
-	BufferHandle uma_wg_list[kUmaRingSlots];
 
 	// Turbo-hacky path.
 	DeviceAllocationOwnerHandle linear_memory;
@@ -68,24 +67,18 @@ struct Decoder::Impl final : public WaveletBuffers
 	// Per-block lookup packed as (level << 4) | (component << 2) | band for O(1) active tracking.
 	std::vector<uint8_t> block_to_comp_level_band;
 	uint8_t active_band_mask[NumComponents][DecompositionLevels] = {};
-	struct IdwtWgSplit
+	struct IdwtLevelLayout
 	{
-		uint32_t ll_offset = 0;
-		uint32_t ll_count = 0;
-		uint32_t all_offset = 0;
-		uint32_t all_count = 0;
-		uint32_t mix_offset = 0;
-		uint32_t mix_count = 0;
+		int32_t ix_end = 0;
+		int32_t iy_end = 0;
 		uint32_t edge_offset = 0;
 		uint32_t edge_count = 0;
-		bool use_list = false;
+		bool use_split = false;
 	};
-	IdwtWgSplit idwt_wg_splits[NumComponents][DecompositionLevels] = {};
-	std::vector<uint32_t> wg_list_cpu;
-	std::vector<uint32_t> wg_ll_scratch;
-	std::vector<uint32_t> wg_all_scratch;
-	std::vector<uint32_t> wg_mix_scratch;
-	std::vector<uint8_t> block_hf_scratch;
+	IdwtLevelLayout idwt_level_layouts[DecompositionLevels] = {};
+	std::vector<uint32_t> edge_wg_list_cpu;
+	bool edge_wg_list_uploaded = false;
+	bool subgroup_ballot_mask = false;
 	bool prewarmed_idwt_intermediate = false;
 	bool prewarmed_idwt_final = false;
 	float prewarmed_range_scale = 0.0f;
@@ -111,7 +104,7 @@ struct Decoder::Impl final : public WaveletBuffers
 
 	void upload_payload(CommandBuffer &cmd);
 	bool upload_payload_uma();
-	void build_idwt_wg_lists();
+	void build_static_edge_wg_lists();
 
 	void check_linear_texture_support();
 };
@@ -228,35 +221,14 @@ bool Decoder::Impl::upload_payload_uma()
 		device->unmap_host_buffer(*offset_buf, MEMORY_ACCESS_WRITE_BIT);
 	}
 
-	if (packed_2x2_wavelets && !wg_list_cpu.empty())
-	{
-		auto &wg_buf = uma_wg_list[uma_slot];
-		VkDeviceSize wg_size = wg_list_cpu.size() * sizeof(uint32_t);
-		if (!wg_buf || wg_size > wg_buf->get_create_info().size)
-		{
-			BufferCreateInfo bufinfo;
-			bufinfo.size = std::max<VkDeviceSize>(64 * 1024, wg_size * 2);
-			bufinfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-			bufinfo.domain = BufferDomain::LinkedDeviceHost;
-			wg_buf = device->create_buffer(bufinfo);
-			if (!wg_buf)
-				return false;
-			device->set_name(*wg_buf, "idwt-wg-list-uma");
-		}
-		auto *wg_dst = static_cast<uint8_t *>(device->map_host_buffer(*wg_buf, MEMORY_ACCESS_WRITE_BIT));
-		if (!wg_dst)
-			return false;
-		memcpy(wg_dst, wg_list_cpu.data(), wg_size);
-		device->unmap_host_buffer(*wg_buf, MEMORY_ACCESS_WRITE_BIT);
-	}
-
 	return true;
 }
 
-void Decoder::Impl::build_idwt_wg_lists()
+void Decoder::Impl::build_static_edge_wg_lists()
 {
-	wg_list_cpu.clear();
-	memset(idwt_wg_splits, 0, sizeof(idwt_wg_splits));
+	edge_wg_list_cpu.clear();
+	edge_wg_list_uploaded = false;
+	std::fill(std::begin(idwt_level_layouts), std::end(idwt_level_layouts), IdwtLevelLayout{});
 	if (!packed_2x2_wavelets)
 		return;
 
@@ -279,128 +251,32 @@ void Decoder::Impl::build_idwt_wg_lists()
 		if (interior_wgs < 1024)
 			continue;
 
-		for (int c = 0; c < NumComponents; c++)
+		auto &layout = idwt_level_layouts[level];
+		layout.use_split = true;
+		layout.ix_end = int32_t(ix_end);
+		layout.iy_end = int32_t(iy_end);
+		layout.edge_offset = uint32_t(edge_wg_list_cpu.size());
+
+		const int edge_total = nx * ny - interior_wgs;
+		edge_wg_list_cpu.resize(edge_wg_list_cpu.size() + size_t(edge_total));
+		uint32_t *edst = edge_wg_list_cpu.data() + layout.edge_offset;
+		for (int gy = 0; gy < ny; gy++)
+			*edst++ = uint32_t(gy) << 16; // gx = 0
+		for (int gx = ix_end; gx < nx; gx++)
 		{
-			if (level == 0 && c != 0 && chroma == ChromaSubsampling::Chroma420)
-				continue;
-
-			auto &split = idwt_wg_splits[c][level];
-			split.use_list = true;
-
-			const uint8_t hf_mask = (active_band_mask[c][level] >> 1) & 0x7u;
-			if (hf_mask == 0)
-			{
-				split.ll_offset = uint32_t(wg_list_cpu.size());
-				wg_list_cpu.resize(wg_list_cpu.size() + size_t(interior_wgs));
-				uint32_t *dst = wg_list_cpu.data() + split.ll_offset;
-				for (int gx = 1; gx < ix_end; gx++)
-				{
-					const uint32_t gx_bits = uint32_t(gx);
-					for (int gy = 1; gy < iy_end; gy++)
-						*dst++ = gx_bits | (uint32_t(gy) << 16);
-				}
-				split.ll_count = uint32_t(interior_wgs);
-			}
-			else
-			{
-				const auto &meta = block_meta[c][level][1];
-				const int bx_cnt = meta.block_stride_32x32;
-				const int blk_cnt = meta.block_count_32x32;
-				const int base1 = meta.block_offset_32x32;
-				const int base2 = base1 + blk_cnt;
-				const int base3 = base2 + blk_cnt;
-				const uint32_t *offs = dequant_offset_buffer_cpu.data();
-
-				block_hf_scratch.resize(blk_cnt);
-				uint8_t *blk_hf = block_hf_scratch.data();
-				const bool has1 = (hf_mask & 1u) != 0;
-				const bool has2 = (hf_mask & 2u) != 0;
-				const bool has3 = (hf_mask & 4u) != 0;
-				for (int i = 0; i < blk_cnt; i++)
-				{
-					uint8_t m = 0;
-					if (has1 && offs[base1 + i] != UINT32_MAX) m |= 1u;
-					if (has2 && offs[base2 + i] != UINT32_MAX) m |= 2u;
-					if (has3 && offs[base3 + i] != UINT32_MAX) m |= 4u;
-					blk_hf[i] = m;
-				}
-
-				wg_ll_scratch.resize(size_t(interior_wgs));
-				wg_all_scratch.resize(size_t(interior_wgs));
-				wg_mix_scratch.resize(size_t(interior_wgs));
-				uint32_t *ll_ptr = wg_ll_scratch.data();
-				uint32_t *all_ptr = wg_all_scratch.data();
-				uint32_t *mix_ptr = wg_mix_scratch.data();
-				uint32_t ll_n = 0, all_n = 0, mix_n = 0;
-
-				// Row-major traversal (gx outer => by fixed, gy inner => sequential bx in block_hf_scratch).
-				for (int gx = 1; gx < ix_end; gx++)
-				{
-					const uint8_t *row0 = blk_hf + ((gx * 16 - 2) >> 5) * bx_cnt;
-					const uint8_t *row1 = blk_hf + ((gx * 16 + 17) >> 5) * bx_cnt;
-					const uint32_t gx_bits = uint32_t(gx);
-					for (int gy = 1; gy < iy_end; gy++)
-					{
-						const int bx0 = (gy * 16 - 2) >> 5;
-						const int bx1 = (gy * 16 + 17) >> 5;
-						const uint8_t m00 = row0[bx0];
-						const uint8_t m01 = row0[bx1];
-						const uint8_t m10 = row1[bx0];
-						const uint8_t m11 = row1[bx1];
-						const uint8_t any_m = m00 | m01 | m10 | m11;
-						const uint32_t packed = gx_bits | (uint32_t(gy) << 16);
-						if (any_m == 0)
-							ll_ptr[ll_n++] = packed;
-						else if ((m00 & m01 & m10 & m11) == 7u)
-							all_ptr[all_n++] = packed;
-						else
-							mix_ptr[mix_n++] = packed;
-					}
-				}
-
-				if (ll_n > 0)
-				{
-					split.ll_offset = uint32_t(wg_list_cpu.size());
-					split.ll_count = ll_n;
-					wg_list_cpu.insert(wg_list_cpu.end(), ll_ptr, ll_ptr + ll_n);
-				}
-				if (all_n > 0)
-				{
-					split.all_offset = uint32_t(wg_list_cpu.size());
-					split.all_count = all_n;
-					wg_list_cpu.insert(wg_list_cpu.end(), all_ptr, all_ptr + all_n);
-				}
-				if (mix_n > 0)
-				{
-					split.mix_offset = uint32_t(wg_list_cpu.size());
-					split.mix_count = mix_n;
-					wg_list_cpu.insert(wg_list_cpu.end(), mix_ptr, mix_ptr + mix_n);
-				}
-			}
-
-			// Pack all 4 disjoint border strips into one edge dispatch.
-			split.edge_offset = uint32_t(wg_list_cpu.size());
-			const int edge_total = nx * ny - interior_wgs;
-			wg_list_cpu.resize(wg_list_cpu.size() + size_t(edge_total));
-			uint32_t *edst = wg_list_cpu.data() + split.edge_offset;
+			const uint32_t gx_bits = uint32_t(gx);
 			for (int gy = 0; gy < ny; gy++)
-				*edst++ = uint32_t(gy) << 16; // gx = 0
-			for (int gx = ix_end; gx < nx; gx++)
-			{
-				const uint32_t gx_bits = uint32_t(gx);
-				for (int gy = 0; gy < ny; gy++)
-					*edst++ = gx_bits | (uint32_t(gy) << 16);
-			}
-			for (int gx = 1; gx < ix_end; gx++)
-				*edst++ = uint32_t(gx); // gy = 0
-			for (int gx = 1; gx < ix_end; gx++)
-			{
-				const uint32_t gx_bits = uint32_t(gx);
-				for (int gy = iy_end; gy < ny; gy++)
-					*edst++ = gx_bits | (uint32_t(gy) << 16);
-			}
-			split.edge_count = uint32_t(edge_total);
+				*edst++ = gx_bits | (uint32_t(gy) << 16);
 		}
+		for (int gx = 1; gx < ix_end; gx++)
+			*edst++ = uint32_t(gx); // gy = 0
+		for (int gx = 1; gx < ix_end; gx++)
+		{
+			const uint32_t gx_bits = uint32_t(gx);
+			for (int gy = iy_end; gy < ny; gy++)
+				*edst++ = gx_bits | (uint32_t(gy) << 16);
+		}
+		layout.edge_count = uint32_t(edge_total);
 	}
 }
 
@@ -574,29 +450,24 @@ void Decoder::Impl::init_block_meta()
 		device->set_name(*dequant_offset_buffer, "meta-buffer");
 	}
 
+	const auto &feats = device->get_device_features();
+	subgroup_ballot_mask =
+		feats.vk11_props.subgroupSize >= 12 &&
+		(!feats.vk13_features.subgroupSizeControl || feats.vk13_props.minSubgroupSize >= 12);
+
 	if (packed_2x2_wavelets)
 	{
-		BufferCreateInfo wg_info;
-		wg_info.size = 128 * 1024;
-		wg_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-		                (use_uma_upload ? 0 : VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-		wg_info.domain = use_uma_upload ? BufferDomain::LinkedDeviceHost : BufferDomain::Device;
-		if (use_uma_upload)
+		build_static_edge_wg_lists();
+		if (!edge_wg_list_cpu.empty())
 		{
-			for (uint32_t i = 0; i < kUmaRingSlots; i++)
-			{
-				uma_wg_list[i] = device->create_buffer(wg_info);
-				if (uma_wg_list[i])
-					device->set_name(*uma_wg_list[i], "idwt-wg-list-uma");
-			}
+			BufferCreateInfo wg_info;
+			wg_info.size = edge_wg_list_cpu.size() * sizeof(uint32_t);
+			wg_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+			wg_info.domain = BufferDomain::Device;
+			edge_wg_list_buffer = device->create_buffer(wg_info);
+			if (edge_wg_list_buffer)
+				device->set_name(*edge_wg_list_buffer, "idwt-edge-wg-list");
 		}
-		else
-		{
-			wg_list_buffer = device->create_buffer(wg_info);
-			if (wg_list_buffer)
-				device->set_name(*wg_list_buffer, "idwt-wg-list");
-		}
-		wg_list_cpu.reserve(32 * 1024);
 	}
 
 	dequant_offset_buffer_cpu.resize(block_count_32x32);
@@ -1067,8 +938,7 @@ bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 {
 	const int prec = Configuration::get().get_precision();
 	const Buffer *active_dequant_offset = use_uma_upload ? uma_dequant_offset[uma_slot].get() : dequant_offset_buffer.get();
-	const Buffer *active_wg_list = use_uma_upload ? uma_wg_list[uma_slot].get() : wg_list_buffer.get();
-	if (packed_2x2_wavelets && (!active_dequant_offset || !active_wg_list))
+	if (packed_2x2_wavelets && !active_dequant_offset)
 		return false;
 
 	cmd.enable_subgroup_size_control(false);
@@ -1095,7 +965,7 @@ bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 			if (!prog)
 				return;
 			cmd.set_program(prog);
-			const uint32_t smask = (final_out ? 0x3u : 0x0u) | 0x4u | 0x8u | 0x10u | 0x20u;
+			const uint32_t smask = (final_out ? 0x3u : 0x0u) | 0x7cu;
 			cmd.set_specialization_constant_mask(smask);
 			if (final_out)
 			{
@@ -1106,6 +976,7 @@ bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 			cmd.set_specialization_constant(3, band_mask);
 			cmd.set_specialization_constant(4, indirect_list);
 			cmd.set_specialization_constant(5, mask_check);
+			cmd.set_specialization_constant(6, subgroup_ballot_mask);
 			DeferredPipelineCompile compile = {};
 			cmd.extract_pipeline_state(compile);
 			if (!prog->get_pipeline(compile.hash).pipeline)
@@ -1115,20 +986,24 @@ bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 		if (!prewarmed_idwt_intermediate)
 		{
 			Program *p = shaders.idwt[prec][1][1];
-			prewarm_one(p, false, 1.0f, false, 0u, true, false);  // LLOnly
-			prewarm_one(p, false, 1.0f, false, 7u, true, false);  // AllActive
-			prewarm_one(p, false, 1.0f, false, 7u, true, true);   // Mixed
-			prewarm_one(p, false, 1.0f, true,  7u, true, true);   // EdgeList
-			prewarm_one(p, false, 1.0f, true,  7u, false, true);  // SmallDirect (L2)
+			prewarm_one(p, false, 1.0f, false, 7u, false, true); // Interior2D
+			if (!edge_wg_list_cpu.empty())
+				prewarm_one(p, false, 1.0f, true, 7u, true, true); // EdgeList1D
+			prewarm_one(p, false, 1.0f, true, 7u, false, true); // SmallDirect2D
 			prewarmed_idwt_intermediate = true;
 		}
 		if (!prewarmed_idwt_final || prewarmed_range_scale != views.range_scale)
 		{
 			Program *p = shaders.idwt[prec][1][0];
-			prewarm_one(p, true, views.range_scale, false, 0u, true, false); // LLOnly
-			prewarm_one(p, true, views.range_scale, false, 7u, true, false); // AllActive
-			prewarm_one(p, true, views.range_scale, false, 7u, true, true);  // Mixed
-			prewarm_one(p, true, views.range_scale, true,  7u, true, true);  // EdgeList
+			if (idwt_level_layouts[0].use_split)
+			{
+				prewarm_one(p, true, views.range_scale, false, 7u, false, true); // Interior2D
+				prewarm_one(p, true, views.range_scale, true, 7u, true, true); // EdgeList1D
+			}
+			else
+			{
+				prewarm_one(p, true, views.range_scale, true, 7u, false, true); // SmallDirect2D
+			}
 			prewarmed_idwt_final = true;
 			prewarmed_range_scale = views.range_scale;
 		}
@@ -1154,72 +1029,49 @@ bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 
 			if (packed_in)
 			{
-				const auto &split = idwt_wg_splits[c][input_level];
+				const auto &layout = idwt_level_layouts[input_level];
 				const auto &meta = block_meta[c][input_level][1];
 				push.block_offset_32x32 = meta.block_offset_32x32;
 				push.block_stride_32x32 = meta.block_stride_32x32;
 				push.band_stride_32x32 = meta.block_count_32x32;
 				cmd.set_texture(0, 0, *component_layer_views[c][input_level]);
 				cmd.set_storage_buffer(0, 2, *active_dequant_offset);
-				cmd.set_storage_buffer(0, 3, *active_wg_list);
+				cmd.set_storage_buffer(0, 3, edge_wg_list_buffer ? *edge_wg_list_buffer : *active_dequant_offset);
 
-				uint32_t spec_mask = (final_output ? 0x3u : 0x0u) | 0x4u | 0x8u | 0x10u | 0x20u;
+				uint32_t spec_mask = (final_output ? 0x3u : 0x0u) | 0x7cu;
 				cmd.set_specialization_constant_mask(spec_mask);
 				if (final_output)
 				{
 					cmd.set_specialization_constant(0, true);
 					cmd.set_specialization_constant(1, views.range_scale);
 				}
+				cmd.set_specialization_constant(3, 7u);
+				cmd.set_specialization_constant(5, true);
+				cmd.set_specialization_constant(6, subgroup_ballot_mask);
 
-				if (split.use_list)
+				if (layout.use_split)
 				{
 					cmd.set_specialization_constant(2, false);
-					cmd.set_specialization_constant(4, true);
+					cmd.set_specialization_constant(4, false);
+					push.wg_offset_x = 1;
+					push.wg_offset_y = 1;
+					cmd.push_constants(&push, 0, sizeof(push));
+					cmd.dispatch(uint32_t(layout.ix_end - 1), uint32_t(layout.iy_end - 1), 1);
 
-					if (split.ll_count > 0)
-					{
-						cmd.set_specialization_constant(3, 0u);
-						cmd.set_specialization_constant(5, false);
-						push.wg_offset_x = int32_t(split.ll_offset);
-						push.wg_offset_y = 0;
-						cmd.push_constants(&push, 0, sizeof(push));
-						cmd.dispatch(split.ll_count, 1, 1);
-					}
-					if (split.all_count > 0)
-					{
-						cmd.set_specialization_constant(3, 7u);
-						cmd.set_specialization_constant(5, false);
-						push.wg_offset_x = int32_t(split.all_offset);
-						push.wg_offset_y = 0;
-						cmd.push_constants(&push, 0, sizeof(push));
-						cmd.dispatch(split.all_count, 1, 1);
-					}
-					if (split.mix_count > 0)
-					{
-						cmd.set_specialization_constant(3, 7u);
-						cmd.set_specialization_constant(5, true);
-						push.wg_offset_x = int32_t(split.mix_offset);
-						push.wg_offset_y = 0;
-						cmd.push_constants(&push, 0, sizeof(push));
-						cmd.dispatch(split.mix_count, 1, 1);
-					}
-					if (split.edge_count > 0)
+					if (layout.edge_count > 0)
 					{
 						cmd.set_specialization_constant(2, true);
-						cmd.set_specialization_constant(3, 7u);
-						cmd.set_specialization_constant(5, true);
-						push.wg_offset_x = int32_t(split.edge_offset);
+						cmd.set_specialization_constant(4, true);
+						push.wg_offset_x = int32_t(layout.edge_offset);
 						push.wg_offset_y = 0;
 						cmd.push_constants(&push, 0, sizeof(push));
-						cmd.dispatch(split.edge_count, 1, 1);
+						cmd.dispatch(layout.edge_count, 1, 1);
 					}
 				}
 				else
 				{
 					cmd.set_specialization_constant(2, true);
-					cmd.set_specialization_constant(3, 7u);
 					cmd.set_specialization_constant(4, false);
-					cmd.set_specialization_constant(5, true);
 					push.wg_offset_x = 0;
 					push.wg_offset_y = 0;
 					cmd.push_constants(&push, 0, sizeof(push));
@@ -1374,7 +1226,14 @@ bool Decoder::Impl::decode_is_ready(bool allow_partial_frame) const
 
 bool Decoder::Impl::decode(CommandBuffer &cmd, const ViewBuffers &views)
 {
-	build_idwt_wg_lists();
+	if (packed_2x2_wavelets && edge_wg_list_buffer && !edge_wg_list_uploaded)
+	{
+		VkDeviceSize wg_size = edge_wg_list_cpu.size() * sizeof(uint32_t);
+		memcpy(cmd.update_buffer(*edge_wg_list_buffer, 0, wg_size), edge_wg_list_cpu.data(), wg_size);
+		cmd.barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+		            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+		edge_wg_list_uploaded = true;
+	}
 
 	if (use_uma_upload)
 	{
@@ -1391,23 +1250,6 @@ bool Decoder::Impl::decode(CommandBuffer &cmd, const ViewBuffers &views)
 			memcpy(cmd.update_buffer(*dequant_offset_buffer, 0,
 			                         dequant_offset_buffer_cpu.size() * sizeof(dequant_offset_buffer_cpu.front())),
 			       dequant_offset_buffer_cpu.data(), dequant_offset_buffer_cpu.size() * sizeof(dequant_offset_buffer_cpu.front()));
-
-			if (packed_2x2_wavelets && !wg_list_cpu.empty())
-			{
-				VkDeviceSize wg_size = wg_list_cpu.size() * sizeof(uint32_t);
-				if (!wg_list_buffer || wg_size > wg_list_buffer->get_create_info().size)
-				{
-					BufferCreateInfo wg_info;
-					wg_info.size = std::max<VkDeviceSize>(64 * 1024, wg_size * 2);
-					wg_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-					wg_info.domain = BufferDomain::Device;
-					wg_list_buffer = device->create_buffer(wg_info);
-					if (wg_list_buffer)
-						device->set_name(*wg_list_buffer, "idwt-wg-list");
-				}
-				if (wg_list_buffer)
-					memcpy(cmd.update_buffer(*wg_list_buffer, 0, wg_size), wg_list_cpu.data(), wg_size);
-			}
 
 			cmd.barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
 			            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
@@ -1558,17 +1400,7 @@ bool Decoder::init(Vulkan::Device *device, int width, int height, ChromaSubsampl
 		return false;
 	}
 
-	// 2x2 RGBA packed wavelets + sparse iDWT workgroup classification is a ~2x win on
-	// NVIDIA/Tegra, whereas Apple Silicon / MoltenVK is ~14% faster on hardware textureGather
-	// iDWT; disable packed wavelets on MoltenVK and Apple GPUs.
-	const auto driver_id = device->get_device_features().driver_id;
-	const auto vendor_id = device->get_gpu_properties().vendorID;
-	const bool use_packed_wavelets =
-		!fragment_path_ &&
-		driver_id != VK_DRIVER_ID_MOLTENVK &&
-		vendor_id != 0x106Bu; // Apple
-
-	if (!impl->init(device, width, height, chroma_, fragment_path_, use_packed_wavelets))
+	if (!impl->init(device, width, height, chroma_, fragment_path_, !fragment_path_))
 	{
 		LOGE("Failed to initialize.\n");
 		return false;
