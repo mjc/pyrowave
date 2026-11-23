@@ -798,7 +798,13 @@ bool Decoder::Impl::dequant(CommandBuffer &cmd)
 {
 	DequantizerPushData push = {};
 
-	cmd.set_specialization_constant_mask(0);
+	// Pascal benefits on sparse input, but this tradeoff did not help Tegra or RADV.
+	const auto &gpu = device->get_gpu_properties();
+	const bool direct_sign_prefix = gpu.vendorID == VENDOR_ID_NVIDIA &&
+		gpu.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+	cmd.set_specialization_constant_mask(direct_sign_prefix ? 1 : 0);
+	if (direct_sign_prefix)
+		cmd.set_specialization_constant(0, true);
 	cmd.enable_subgroup_size_control(true);
 
 	if (device->supports_subgroup_size_log2(true, 4, 7))
@@ -937,6 +943,7 @@ bool Decoder::Impl::dequant(CommandBuffer &cmd)
 	auto end_dequant = cmd.write_timestamp(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 	if (debug_labels)
 		cmd.end_region();
+	cmd.set_specialization_constant_mask(0);
 	cmd.enable_subgroup_size_control(false);
 	device->register_time_interval("GPU", std::move(start_dequant), std::move(end_dequant), "Dequant");
 

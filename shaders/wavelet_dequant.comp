@@ -18,6 +18,7 @@
 #endif
 
 layout(local_size_x = 128) in;
+layout(constant_id = 0) const bool DirectSignPrefix = false;
 
 layout(set = 0, binding = 0) writeonly uniform image2DArray uDequantImg;
 
@@ -458,7 +459,12 @@ void main()
     if (gl_SubgroupInvocationID == gl_SubgroupSize - 1)
         shared_sign_scan[gl_SubgroupID] = significant_scan;
 
-    if (gl_NumSubgroups <= 8)
+    if (DirectSignPrefix && gl_NumSubgroups <= 4)
+    {
+        // Read the subgroup totals directly instead of rewriting a prefix table.
+        barrier();
+    }
+    else if (gl_NumSubgroups <= 8)
     {
         barrier();
 		if (gl_SubgroupSize <= 32)
@@ -484,7 +490,13 @@ void main()
     {
         // Compute where we need to start reading sign bits from.
         uint sign_offset = shared_sign_offset + significant_scan - significant_count;
-        if (gl_SubgroupID != 0)
+        if (DirectSignPrefix && gl_NumSubgroups <= 4)
+        {
+            if (gl_SubgroupID > 0u) sign_offset += shared_sign_scan[0];
+            if (gl_SubgroupID > 1u) sign_offset += shared_sign_scan[1];
+            if (gl_SubgroupID > 2u) sign_offset += shared_sign_scan[2];
+        }
+        else if (gl_SubgroupID != 0)
             sign_offset += shared_sign_scan[gl_SubgroupID - 1];
 
         // Read out all sign bits we could possibly access per thread.
