@@ -107,7 +107,6 @@ struct Decoder::Impl final : public WaveletBuffers
 	};
 	std::vector<ActiveBlockEntry> active_block_list[NumComponents][DecompositionLevels];
 	uint32_t active_block_offset[NumComponents][DecompositionLevels] = {};
-	uint8_t active_band_mask[NumComponents][DecompositionLevels] = {};
 	uint32_t active_hf_blocks[NumComponents][DecompositionLevels] = {};
 	struct IdwtLevelLayout
 	{
@@ -136,7 +135,6 @@ struct Decoder::Impl final : public WaveletBuffers
 	                     const uint32_t *active_block_mask, size_t word_count) const;
 	bool has_pristine_bands(int bands, const uint32_t *active_block_mask, size_t word_count) const;
 
-	bool decode_packet(const BitstreamHeader *header);
 
 	bool dequant(CommandBuffer &cmd);
 	bool idwt(CommandBuffer &cmd, const ViewBuffers &views);
@@ -517,58 +515,6 @@ void Decoder::Impl::build_static_edge_wg_lists()
 	}
 }
 
-bool Decoder::Impl::decode_packet(const BitstreamHeader *header)
-{
-	auto *payload_words = reinterpret_cast<const uint32_t *>(header);
-
-	if (sizeof(*header) / sizeof(uint32_t) > header->payload_words)
-	{
-		LOGE("payload_words is not large enough.\n");
-		return false;
-	}
-
-	auto &offset = dequant_offset_buffer_cpu[header->block_index];
-	if (offset == UINT32_MAX)
-	{
-		decoded_blocks++;
-		offset = uint32_t(uma_payload_written_words + payload_data_cpu.size());
-		uint8_t clb = block_to_comp_level_band[header->block_index];
-		const uint8_t comp = (clb >> 2) & 3u;
-		const uint8_t lvl = clb >> 4;
-		const uint8_t bnd = clb & 3u;
-		active_band_mask[comp][lvl] |= uint8_t(1u << bnd);
-		if (bnd != 0)
-		{
-			const uint32_t idx = active_hf_blocks[comp][lvl]++;
-			if (packed_2x2_wavelets && lvl < DecompositionLevels - 1)
-				active_block_list[comp][lvl][idx] = { block_dequant_coord[header->block_index], offset };
-		}
-	}
-	else
-	{
-		return true;
-	}
-
-	if (uma_payload_write_ptr &&
-	    !uma_slot_submitted &&
-	    payload_data_cpu.empty() &&
-	    uma_payload_written_words + header->payload_words + 4 <= uma_payload_cap_words)
-	{
-		memcpy(uma_payload_write_ptr + uma_payload_written_words,
-		       payload_words,
-		       header->payload_words * sizeof(uint32_t));
-		uma_payload_written_words += header->payload_words;
-	}
-	else
-	{
-		payload_data_cpu.insert(
-				payload_data_cpu.end(),
-				payload_words,
-				payload_words + header->payload_words);
-	}
-	return true;
-}
-
 bool Decoder::Impl::push_packet(const void *data_, size_t size)
 {
 	auto *data = static_cast<const uint8_t *>(data_);
@@ -702,7 +648,6 @@ bool Decoder::Impl::push_packet(const void *data_, size_t size)
 			const uint8_t comp = (clb >> 2) & 3u;
 			const uint8_t lvl = clb >> 4;
 			const uint8_t bnd = clb & 3u;
-			active_band_mask[comp][lvl] |= uint8_t(1u << bnd);
 			if (bnd != 0)
 			{
 				const uint32_t idx = active_hf_blocks[comp][lvl]++;
@@ -1726,7 +1671,6 @@ void Decoder::Impl::clear()
 		memset(uma_offset_write_ptr, 0xff, size_t(block_count_32x32) * sizeof(uint32_t));
 	else
 		memset(dequant_offset_buffer_cpu.data(), 0xff, dequant_offset_buffer_cpu.size() * sizeof(uint32_t));
-	memset(active_band_mask, 0, sizeof(active_band_mask));
 	memset(active_hf_blocks, 0, sizeof(active_hf_blocks));
 	memset(active_block_offset, 0, sizeof(active_block_offset));
 	decoded_blocks = 0;
