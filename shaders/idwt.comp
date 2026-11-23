@@ -82,6 +82,16 @@ void write_shared_4x4(ivec2 coord, VEC4 texels0, VEC4 texels1, VEC4 texels2, VEC
 }
 
 #if PACKED_INPUT
+void write_shared_4x4_ll(ivec2 coord, VEC4 texels0)
+{
+    store_shared(coord.y + 0, 2 * coord.x + 0, VEC2(texels0.x, FLOAT(0.0)));
+    store_shared(coord.y + 0, 2 * coord.x + 2, VEC2(texels0.y, FLOAT(0.0)));
+    store_shared(coord.y + 1, 2 * coord.x + 0, VEC2(texels0.z, FLOAT(0.0)));
+    store_shared(coord.y + 1, 2 * coord.x + 2, VEC2(texels0.w, FLOAT(0.0)));
+}
+#endif
+
+#if PACKED_INPUT
 ivec2 workgroup_xy()
 {
     if (IndirectList)
@@ -159,7 +169,10 @@ void load_tile_ll(ivec2 base_coord, ivec2 lc)
     ivec2 c = base_coord + lc;
     ivec2 q = ivec2(c.y >> 1, c.x >> 1);
     VEC4 t0 = VEC4(texelFetch(uTexture, ivec3(q, 0), 0).xzyw);
-    write_shared_4x4(lc, t0, VEC4(0.0), VEC4(0.0), VEC4(0.0));
+    if (ActiveBandMask == 0u)
+        write_shared_4x4_ll(lc, t0);
+    else
+        write_shared_4x4(lc, t0, VEC4(0.0), VEC4(0.0), VEC4(0.0));
 }
 
 void load_tile_mixed(ivec2 base_coord, ivec2 lc, uint mask1, uint mask2, uint mask3, int bx0, int by0)
@@ -259,33 +272,50 @@ void load_image_with_apron(ivec2 wg)
             if (pass == 2 && lc.x >= BLOCK_SIZE_HALF) continue;
 
             ivec2 c = base_coord + lc;
-            VEC4 t0, t1, t2, t3;
-            if (c.x >= 0 && c.x <= resolution.x - 2 && c.y >= 0 && c.y <= resolution.y - 2)
+            if (ActiveBandMask == 0u)
             {
-                ivec2 q = ivec2(c.y >> 1, c.x >> 1);
-                t0 = VEC4(texelFetch(uTexture, ivec3(q, 0), 0).xzyw);
-                if (!MaskCheck && ActiveBandMask == 7u)
+                VEC4 t0;
+                if (c.x >= 0 && c.x <= resolution.x - 2 && c.y >= 0 && c.y <= resolution.y - 2)
                 {
-                    t1 = VEC4(texelFetch(uTexture, ivec3(q, 2), 0).xzyw);
-                    t2 = VEC4(texelFetch(uTexture, ivec3(q, 1), 0).xzyw);
-                    t3 = VEC4(texelFetch(uTexture, ivec3(q, 3), 0).xzyw);
+                    ivec2 q = ivec2(c.y >> 1, c.x >> 1);
+                    t0 = VEC4(texelFetch(uTexture, ivec3(q, 0), 0).xzyw);
                 }
                 else
                 {
-                    uint bm = 1u << (uint((q.x >> 4) != bx0) | (uint((q.y >> 4) != by0) << 1));
-                    t1 = ((ActiveBandMask & 2u) != 0u && (!MaskCheck || (mask2 & bm) != 0u)) ? VEC4(texelFetch(uTexture, ivec3(q, 2), 0).xzyw) : VEC4(0.0);
-                    t2 = ((ActiveBandMask & 1u) != 0u && (!MaskCheck || (mask1 & bm) != 0u)) ? VEC4(texelFetch(uTexture, ivec3(q, 1), 0).xzyw) : VEC4(0.0);
-                    t3 = ((ActiveBandMask & 4u) != 0u && (!MaskCheck || (mask3 & bm) != 0u)) ? VEC4(texelFetch(uTexture, ivec3(q, 3), 0).xzyw) : VEC4(0.0);
+                    t0 = fetch_quad_edge_oob(c, true, true, 0, 0xfu);
                 }
+                write_shared_4x4_ll(lc, t0);
             }
             else
             {
-                t0 = fetch_quad_edge_oob(c, true,  true,  0, 0xfu);
-                t1 = ((ActiveBandMask & 2u) != 0u) ? fetch_quad_edge_oob(c, false, true,  2, mask2) : VEC4(0.0);
-                t2 = ((ActiveBandMask & 1u) != 0u) ? fetch_quad_edge_oob(c, true,  false, 1, mask1) : VEC4(0.0);
-                t3 = ((ActiveBandMask & 4u) != 0u) ? fetch_quad_edge_oob(c, false, false, 3, mask3) : VEC4(0.0);
+                VEC4 t0, t1, t2, t3;
+                if (c.x >= 0 && c.x <= resolution.x - 2 && c.y >= 0 && c.y <= resolution.y - 2)
+                {
+                    ivec2 q = ivec2(c.y >> 1, c.x >> 1);
+                    t0 = VEC4(texelFetch(uTexture, ivec3(q, 0), 0).xzyw);
+                    if (!MaskCheck && ActiveBandMask == 7u)
+                    {
+                        t1 = VEC4(texelFetch(uTexture, ivec3(q, 2), 0).xzyw);
+                        t2 = VEC4(texelFetch(uTexture, ivec3(q, 1), 0).xzyw);
+                        t3 = VEC4(texelFetch(uTexture, ivec3(q, 3), 0).xzyw);
+                    }
+                    else
+                    {
+                        uint bm = 1u << (uint((q.x >> 4) != bx0) | (uint((q.y >> 4) != by0) << 1));
+                        t1 = ((ActiveBandMask & 2u) != 0u && (!MaskCheck || (mask2 & bm) != 0u)) ? VEC4(texelFetch(uTexture, ivec3(q, 2), 0).xzyw) : VEC4(0.0);
+                        t2 = ((ActiveBandMask & 1u) != 0u && (!MaskCheck || (mask1 & bm) != 0u)) ? VEC4(texelFetch(uTexture, ivec3(q, 1), 0).xzyw) : VEC4(0.0);
+                        t3 = ((ActiveBandMask & 4u) != 0u && (!MaskCheck || (mask3 & bm) != 0u)) ? VEC4(texelFetch(uTexture, ivec3(q, 3), 0).xzyw) : VEC4(0.0);
+                    }
+                }
+                else
+                {
+                    t0 = fetch_quad_edge_oob(c, true,  true,  0, 0xfu);
+                    t1 = ((ActiveBandMask & 2u) != 0u) ? fetch_quad_edge_oob(c, false, true,  2, mask2) : VEC4(0.0);
+                    t2 = ((ActiveBandMask & 1u) != 0u) ? fetch_quad_edge_oob(c, true,  false, 1, mask1) : VEC4(0.0);
+                    t3 = ((ActiveBandMask & 4u) != 0u) ? fetch_quad_edge_oob(c, false, false, 3, mask3) : VEC4(0.0);
+                }
+                write_shared_4x4(lc, t0, t1, t2, t3);
             }
-            write_shared_4x4(lc, t0, t1, t2, t3);
         }
     }
 
@@ -442,6 +472,62 @@ void inverse_transform4x2(bool active_lane, int y_offset)
     }
 }
 
+#if PACKED_INPUT
+void inverse_transform8x2_ll()
+{
+    FLOAT ev[7]; // even indices 2, 4, 6, 8, 10, 12, 14
+    FLOAT od[6]; // odd indices  3, 5, 7, 9, 11, 13
+
+    ivec2 local_coord = ivec2(8 * (local_index % 4u), local_index / 4u);
+
+    for (int k = 0; k < 7; k++)
+        ev[k] = load_shared(local_coord.y, local_coord.x + 2 * k + 2).x * K;
+
+    // Step 1 (DELTA) is a no-op because all HF samples are zero.
+    for (int k = 0; k < 6; k++)
+        od[k] = -GAMMA * (ev[k] + ev[k + 1]);
+    for (int k = 0; k < 5; k++)
+        ev[k + 1] -= BETA * (od[k] + od[k + 1]);
+    for (int k = 0; k < 4; k++)
+        od[k + 1] -= ALPHA * (ev[k + 1] + ev[k + 2]);
+
+    barrier();
+
+    for (int k = 0; k < 4; k++)
+    {
+        int y_coord = (local_coord.x >> 1) + k;
+        store_shared(y_coord, 2 * local_coord.y + 0, VEC2(ev[k + 1], od[k + 1]));
+    }
+}
+
+void inverse_transform4x2_ll(bool active_lane, int y_offset)
+{
+    FLOAT ev[5]; // even indices 2, 4, 6, 8, 10
+    FLOAT od[4]; // odd indices  3, 5, 7, 9
+
+    ivec2 local_coord = ivec2(4 * (local_index % 8u), local_index / 8u + y_offset);
+
+    if (active_lane)
+    {
+        for (int k = 0; k < 5; k++)
+            ev[k] = load_shared(local_coord.y, local_coord.x + 2 * k + 2).x * K;
+
+        for (int k = 0; k < 4; k++)
+            od[k] = -GAMMA * (ev[k] + ev[k + 1]);
+        for (int k = 0; k < 3; k++)
+            ev[k + 1] -= BETA * (od[k] + od[k + 1]);
+        for (int k = 0; k < 2; k++)
+            od[k + 1] -= ALPHA * (ev[k + 1] + ev[k + 2]);
+
+        for (int k = 0; k < 2; k++)
+        {
+            int y_coord = (local_coord.x >> 1) + k;
+            store_shared(y_coord, 2 * local_coord.y + 0, VEC2(ev[k + 1], od[k + 1]));
+        }
+    }
+}
+#endif
+
 #if !PACKED_OUTPUT
 void store_output_pair(int out_x, int out_y, VEC2 v)
 {
@@ -471,42 +557,74 @@ void inverse_transform8x2_and_store()
 {
     const int SIZE = 8;
     const int PADDED_SIZE = SIZE + 2 * APRON;
-    VEC2 values[PADDED_SIZE];
 
     ivec2 local_coord = ivec2(8 * (local_index % 4u), local_index / 4u);
 
-    for (int i = 0; i < PADDED_SIZE; i += 2)
+    VEC2 v4, v5, v6, v7, v8, v9, v10, v11;
+#if PACKED_INPUT
+    if (ActiveBandMask == 0u)
     {
-        VEC2 v0 = load_shared(local_coord.y, local_coord.x + i + 0);
-        VEC2 v1 = load_shared(local_coord.y, local_coord.x + i + 1);
-        values[i + 0] = v0 * K;
-        values[i + 1] = v1 * inv_K;
-    }
+        VEC2 ev[7]; // even indices 2, 4, 6, 8, 10, 12, 14
+        VEC2 od[6]; // odd indices  3, 5, 7, 9, 11, 13
 
-    // CDF 9/7 lifting steps.
-    for (int i = 2; i < PADDED_SIZE - 1; i += 2)
-        values[i] -= DELTA * (values[i - 1] + values[i + 1]);
-    for (int i = 3; i < PADDED_SIZE - 2; i += 2)
-        values[i] -= GAMMA * (values[i - 1] + values[i + 1]);
-    for (int i = 4; i < PADDED_SIZE - 3; i += 2)
-        values[i] -= BETA * (values[i - 1] + values[i + 1]);
-    for (int i = 5; i < PADDED_SIZE - 4; i += 2)
-        values[i] -= ALPHA * (values[i - 1] + values[i + 1]);
+        for (int k = 0; k < 7; k++)
+            ev[k] = load_shared(local_coord.y, local_coord.x + 2 * k + 2) * K;
+
+        for (int k = 0; k < 6; k++)
+            od[k] = -GAMMA * (ev[k] + ev[k + 1]);
+        for (int k = 0; k < 5; k++)
+            ev[k + 1] -= BETA * (od[k] + od[k + 1]);
+        for (int k = 0; k < 4; k++)
+            od[k + 1] -= ALPHA * (ev[k + 1] + ev[k + 2]);
+
+        v4 = ev[1]; v5 = od[1];
+        v6 = ev[2]; v7 = od[2];
+        v8 = ev[3]; v9 = od[3];
+        v10 = ev[4]; v11 = od[4];
+    }
+    else
+#endif
+    {
+        VEC2 values[PADDED_SIZE];
+
+        for (int i = 0; i < PADDED_SIZE; i += 2)
+        {
+            VEC2 v0 = load_shared(local_coord.y, local_coord.x + i + 0);
+            VEC2 v1 = load_shared(local_coord.y, local_coord.x + i + 1);
+            values[i + 0] = v0 * K;
+            values[i + 1] = v1 * inv_K;
+        }
+
+        // CDF 9/7 lifting steps.
+        for (int i = 2; i < PADDED_SIZE - 1; i += 2)
+            values[i] -= DELTA * (values[i - 1] + values[i + 1]);
+        for (int i = 3; i < PADDED_SIZE - 2; i += 2)
+            values[i] -= GAMMA * (values[i - 1] + values[i + 1]);
+        for (int i = 4; i < PADDED_SIZE - 3; i += 2)
+            values[i] -= BETA * (values[i - 1] + values[i + 1]);
+        for (int i = 5; i < PADDED_SIZE - 4; i += 2)
+            values[i] -= ALPHA * (values[i - 1] + values[i + 1]);
+
+        v4 = values[4]; v5 = values[5];
+        v6 = values[6]; v7 = values[7];
+        v8 = values[8]; v9 = values[9];
+        v10 = values[10]; v11 = values[11];
+    }
 
     // 4x4 subgroup transpose across the 4 X-chunk lanes so imageStore writes
     // contiguous 4x8 quads (8x16 pixels) per 32-thread subgroup with no barriers.
 #if PRECISION == 2
 #define QUAD_T vec4
-    QUAD_T q0 = vec4(values[4].x, values[5].x, values[4].y, values[5].y);
-    QUAD_T q1 = vec4(values[6].x, values[7].x, values[6].y, values[7].y);
-    QUAD_T q2 = vec4(values[8].x, values[9].x, values[8].y, values[9].y);
-    QUAD_T q3 = vec4(values[10].x, values[11].x, values[10].y, values[11].y);
+    QUAD_T q0 = vec4(v4.x, v5.x, v4.y, v5.y);
+    QUAD_T q1 = vec4(v6.x, v7.x, v6.y, v7.y);
+    QUAD_T q2 = vec4(v8.x, v9.x, v8.y, v9.y);
+    QUAD_T q3 = vec4(v10.x, v11.x, v10.y, v11.y);
 #else
 #define QUAD_T uvec2
-    QUAD_T q0 = pack_output_quad(values[4], values[5]);
-    QUAD_T q1 = pack_output_quad(values[6], values[7]);
-    QUAD_T q2 = pack_output_quad(values[8], values[9]);
-    QUAD_T q3 = pack_output_quad(values[10], values[11]);
+    QUAD_T q0 = pack_output_quad(v4, v5);
+    QUAD_T q1 = pack_output_quad(v6, v7);
+    QUAD_T q2 = pack_output_quad(v8, v9);
+    QUAD_T q3 = pack_output_quad(v10, v11);
 #endif
 
     uint c = local_index & 3u;
@@ -563,11 +681,21 @@ void main()
 
     load_image_with_apron(workgroup_xy());
 
-    // Horizontal transform.
-    inverse_transform8x2();
+#if PACKED_INPUT
+    if (ActiveBandMask == 0u)
+    {
+        inverse_transform8x2_ll();
+        inverse_transform4x2_ll(local_index < 32, BLOCK_SIZE_HALF);
+    }
+    else
+#endif
+    {
+        // Horizontal transform.
+        inverse_transform8x2();
 
-    // Also need to transform the apron.
-    inverse_transform4x2(local_index < 32, BLOCK_SIZE_HALF);
+        // Also need to transform the apron.
+        inverse_transform4x2(local_index < 32, BLOCK_SIZE_HALF);
+    }
 
     barrier();
 
