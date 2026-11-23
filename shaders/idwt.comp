@@ -29,6 +29,7 @@ layout(constant_id = 3) const uint ActiveBandMask = 7u; // bit0=band1(LH), bit1=
 layout(constant_id = 4) const bool IndirectList = false;
 layout(constant_id = 5) const bool MaskCheck = true;
 layout(constant_id = 6) const bool SubgroupBallotMask = true;
+layout(constant_id = 7) const bool DynamicLLOnly = false;
 
 uint local_index;
 
@@ -210,7 +211,7 @@ ivec2 load_apron_coord()
     return ivec2(2 * int(vi >> 1), BLOCK_SIZE_HALF + 2 * int(vi & 1u));
 }
 
-void load_image_with_apron(ivec2 wg)
+bool load_image_with_apron(ivec2 wg)
 {
     ivec2 base_coord = wg * ivec2(BLOCK_SIZE_HALF) - APRON_HALF;
 
@@ -252,6 +253,7 @@ void load_image_with_apron(ivec2 wg)
         }
     }
 
+    bool wg_ll_only = (ActiveBandMask == 0u) || (DynamicLLOnly && MaskCheck && (mask1 | mask2 | mask3) == 0u);
     bool wg_interior = !EdgePass || (base_coord.x >= 0 && base_coord.x + 19 < resolution.x &&
                                      base_coord.y >= 0 && base_coord.y + 19 < resolution.y);
 
@@ -259,7 +261,7 @@ void load_image_with_apron(ivec2 wg)
     {
         ivec2 local_coord0 = 2 * unswizzle8x8(local_index);
         bool has_apron = (local_index < 20u) || ((local_index - 32u) < 16u);
-        if (ActiveBandMask == 0u || (MaskCheck && (mask1 | mask2 | mask3) == 0u))
+        if (wg_ll_only || (MaskCheck && (mask1 | mask2 | mask3) == 0u))
         {
             ivec2 c0 = base_coord + local_coord0;
             VEC4 t0 = VEC4(texelFetch(uTexture, ivec3(c0.y >> 1, c0.x >> 1, 0), 0).xzyw);
@@ -271,7 +273,7 @@ void load_image_with_apron(ivec2 wg)
                 ivec2 ca = base_coord + ac;
                 ta = VEC4(texelFetch(uTexture, ivec3(ca.y >> 1, ca.x >> 1, 0), 0).xzyw);
             }
-            if (ActiveBandMask == 0u)
+            if (wg_ll_only)
             {
                 write_shared_4x4_ll(local_coord0, t0);
                 if (has_apron)
@@ -308,7 +310,7 @@ void load_image_with_apron(ivec2 wg)
             ivec2 lc = (pass == 0) ? local_coord0 : load_apron_coord();
 
             ivec2 c = base_coord + lc;
-            if (ActiveBandMask == 0u)
+            if (wg_ll_only)
             {
                 VEC4 t0;
                 if (c.x >= 0 && c.x <= resolution.x - 2 && c.y >= 0 && c.y <= resolution.y - 2)
@@ -356,6 +358,7 @@ void load_image_with_apron(ivec2 wg)
     }
 
     barrier();
+    return wg_ll_only;
 }
 #else
 ivec2 workgroup_xy()
@@ -372,7 +375,7 @@ vec2 generate_mirror_uv(ivec2 coord, bool even_x, bool even_y)
     return uv.yx; // Transpose on load.
 }
 
-void load_image_with_apron(ivec2 wg)
+bool load_image_with_apron(ivec2 wg)
 {
     ivec2 base_coord = wg * ivec2(BLOCK_SIZE_HALF) - APRON_HALF;
     ivec2 local_coord0 = 2 * unswizzle8x8(local_index);
@@ -406,6 +409,7 @@ void load_image_with_apron(ivec2 wg)
     }
 
     barrier();
+    return false;
 }
 #endif
 
@@ -620,7 +624,7 @@ uvec2 pack_output_quad(VEC2 a, VEC2 b)
 }
 #endif
 
-void inverse_transform8x2_and_store(ivec2 wg)
+void inverse_transform8x2_and_store(ivec2 wg, bool wg_ll_only)
 {
     const int SIZE = 8;
     const int PADDED_SIZE = SIZE + 2 * APRON;
@@ -629,7 +633,7 @@ void inverse_transform8x2_and_store(ivec2 wg)
 
     VEC2 v4, v5, v6, v7, v8, v9, v10, v11;
 #if PACKED_INPUT
-    if (ActiveBandMask == 0u)
+    if (wg_ll_only)
     {
         VEC2 ev[7]; // even indices 2, 4, 6, 8, 10, 12, 14
         VEC2 od[6]; // odd indices  3, 5, 7, 9, 11, 13
@@ -741,10 +745,10 @@ void main()
     local_index = gl_LocalInvocationIndex;
 
     ivec2 wg = workgroup_xy();
-    load_image_with_apron(wg);
+    bool wg_ll_only = load_image_with_apron(wg);
 
 #if PACKED_INPUT
-    if (ActiveBandMask == 0u)
+    if (wg_ll_only)
     {
         inverse_transform8x2_ll();
         inverse_transform4x2_ll(local_index < 32, BLOCK_SIZE_HALF);
@@ -762,5 +766,5 @@ void main()
     barrier();
 
     // Vertical transform + coalesced subgroup-transposed direct store.
-    inverse_transform8x2_and_store(wg);
+    inverse_transform8x2_and_store(wg, wg_ll_only);
 }

@@ -1293,11 +1293,12 @@ bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 	if (packed_2x2_wavelets)
 	{
 		const auto prewarm_one = [&](Program *prog, bool final_out, float rscale,
-		                             bool edge_pass, uint32_t band_mask, bool indirect_list, bool mask_check) {
+		                             bool edge_pass, uint32_t band_mask, bool indirect_list,
+		                             bool mask_check, bool dynamic_ll) {
 			if (!prog)
 				return;
 			cmd.set_program(prog);
-			const uint32_t smask = (final_out ? 0x3u : 0x0u) | 0x7cu;
+			const uint32_t smask = (final_out ? 0x3u : 0x0u) | 0xfcu;
 			cmd.set_specialization_constant_mask(smask);
 			if (final_out)
 			{
@@ -1309,6 +1310,7 @@ bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 			cmd.set_specialization_constant(4, indirect_list);
 			cmd.set_specialization_constant(5, mask_check);
 			cmd.set_specialization_constant(6, subgroup_ballot_mask);
+			cmd.set_specialization_constant(7, dynamic_ll);
 			DeferredPipelineCompile compile = {};
 			cmd.extract_pipeline_state(compile);
 			if (!prog->get_pipeline(compile.hash).pipeline)
@@ -1318,13 +1320,14 @@ bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 		const auto prewarm_level = [&](bool final_out, bool split) {
 			Program *p = shaders.idwt[prec][1][final_out ? 0 : 1];
 			const float scale = final_out ? views.range_scale : 1.0f;
-			for (int variant = 0; variant < 3; variant++)
+			for (int variant = 0; variant < 4; variant++)
 			{
 				const uint32_t bands = variant == 0 ? 0u : 7u;
-				const bool mask_check = variant == 2;
+				const bool mask_check = variant >= 2;
+				const bool dynamic_ll = variant == 3;
 				if (split)
-					prewarm_one(p, final_out, scale, false, bands, false, mask_check);
-				prewarm_one(p, final_out, scale, true, bands, split, mask_check);
+					prewarm_one(p, final_out, scale, false, bands, false, mask_check, dynamic_ll);
+				prewarm_one(p, final_out, scale, true, bands, split, mask_check, dynamic_ll);
 			}
 		};
 
@@ -1382,7 +1385,7 @@ bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 				cmd.set_storage_buffer(0, 2, *active_dequant_offset);
 				cmd.set_storage_buffer(0, 3, edge_wg_list_buffer ? *edge_wg_list_buffer : *active_dequant_offset);
 
-				uint32_t spec_mask = (final_output ? 0x3u : 0x0u) | 0x7cu;
+				uint32_t spec_mask = (final_output ? 0x3u : 0x0u) | 0xfcu;
 				cmd.set_specialization_constant_mask(spec_mask);
 				if (final_output)
 				{
@@ -1393,9 +1396,11 @@ bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 				const uint32_t total_hf = 3u * uint32_t(meta.block_count_32x32);
 				const bool ll_only = act_hf == 0;
 				const bool mask_check = act_hf > 0 && act_hf < total_hf;
+				const bool dynamic_ll = mask_check && (act_hf * 3u < total_hf);
 				cmd.set_specialization_constant(3, ll_only ? 0u : 7u);
 				cmd.set_specialization_constant(5, mask_check);
 				cmd.set_specialization_constant(6, subgroup_ballot_mask);
+				cmd.set_specialization_constant(7, dynamic_ll);
 
 				if (layout.use_split)
 				{
