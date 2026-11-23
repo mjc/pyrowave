@@ -1363,39 +1363,39 @@ bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 				CommandBuffer::build_compute_pipeline(device, compile, CommandBuffer::CompileMode::Sync);
 		};
 
+		const auto prewarm_level = [&](bool final_out, bool split) {
+			Program *p = shaders.idwt[prec][1][final_out ? 0 : 1];
+			const float scale = final_out ? views.range_scale : 1.0f;
+			for (int variant = 0; variant < 3; variant++)
+			{
+				const uint32_t bands = variant == 0 ? 0u : 7u;
+				const bool mask_check = variant == 2;
+				if (split)
+					prewarm_one(p, final_out, scale, false, bands, false, mask_check);
+				prewarm_one(p, final_out, scale, true, bands, split, mask_check);
+			}
+		};
+
 		if (!prewarmed_idwt_intermediate)
 		{
-			Program *p = shaders.idwt[prec][1][1];
-			prewarm_one(p, false, 1.0f, false, 0u, false, false); // LLOnly 2D
-			prewarm_one(p, false, 1.0f, false, 7u, false, false); // AllActive 2D
-			prewarm_one(p, false, 1.0f, false, 7u, false, true);  // Mixed 2D
-			if (!edge_wg_list_cpu.empty())
+			bool split = false, direct = false;
+			for (int level = 1; level < DecompositionLevels - 1; level++)
 			{
-				prewarm_one(p, false, 1.0f, true, 0u, true, false); // Edge LLOnly
-				prewarm_one(p, false, 1.0f, true, 7u, true, false); // Edge AllActive
-				prewarm_one(p, false, 1.0f, true, 7u, true, true);  // Edge Mixed
+				split |= idwt_level_layouts[level].use_split;
+				direct |= !idwt_level_layouts[level].use_split;
 			}
-			prewarm_one(p, false, 1.0f, true, 7u, false, false); // SmallDirect AllActive
-			prewarm_one(p, false, 1.0f, true, 7u, false, true);  // SmallDirect Mixed
+			if (split)
+				prewarm_level(false, true);
+			if (direct)
+				prewarm_level(false, false);
 			prewarmed_idwt_intermediate = true;
 		}
 		if (!prewarmed_idwt_final || prewarmed_range_scale != views.range_scale)
 		{
-			Program *p = shaders.idwt[prec][1][0];
-			if (idwt_level_layouts[0].use_split)
-			{
-				prewarm_one(p, true, views.range_scale, false, 0u, false, false);
-				prewarm_one(p, true, views.range_scale, false, 7u, false, false);
-				prewarm_one(p, true, views.range_scale, false, 7u, false, true);
-				prewarm_one(p, true, views.range_scale, true,  0u, true,  false);
-				prewarm_one(p, true, views.range_scale, true,  7u, true,  false);
-				prewarm_one(p, true, views.range_scale, true,  7u, true,  true);
-			}
-			else
-			{
-				prewarm_one(p, true, views.range_scale, true, 7u, false, false);
-				prewarm_one(p, true, views.range_scale, true, 7u, false, true);
-			}
+			const bool luma_split = idwt_level_layouts[0].use_split;
+			prewarm_level(true, luma_split);
+			if (chroma == ChromaSubsampling::Chroma420 && idwt_level_layouts[1].use_split != luma_split)
+				prewarm_level(true, !luma_split);
 			prewarmed_idwt_final = true;
 			prewarmed_range_scale = views.range_scale;
 		}
