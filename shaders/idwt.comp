@@ -14,9 +14,10 @@
 #define PACKED_OUTPUT 0
 #endif
 
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : require
 #if PACKED_INPUT
 #extension GL_KHR_shader_subgroup_ballot : require
-#extension GL_EXT_control_flow_attributes : require
 #extension GL_EXT_samplerless_texture_functions : require
 #endif
 
@@ -441,12 +442,126 @@ void inverse_transform4x2(bool active_lane, int y_offset)
     }
 }
 
+#if !PACKED_OUTPUT
+void store_output_pair(int out_x, int out_y, VEC2 v)
+{
+    if (DCShift)
+        v += FLOAT(0.5);
+    if (RangeScale != 1.0)
+        v = clamp(v, FLOAT(0.0), FLOAT(1.0)) * FLOAT(RangeScale);
+    imageStore(uOutput, ivec2(out_x + 0, out_y), v.xxxx);
+    imageStore(uOutput, ivec2(out_x + 1, out_y), v.yyyy);
+}
+#endif
+
+#if PRECISION != 2
+uvec2 pack_output_quad(VEC2 a, VEC2 b)
+{
+#if FP16
+    return uvec2(packHalf2x16(vec2(f16vec2(a.x, b.x))),
+                 packHalf2x16(vec2(f16vec2(a.y, b.y))));
+#else
+    return uvec2(packHalf2x16(vec2(a.x, b.x)),
+                 packHalf2x16(vec2(a.y, b.y)));
+#endif
+}
+#endif
+
+void inverse_transform8x2_and_store()
+{
+    const int SIZE = 8;
+    const int PADDED_SIZE = SIZE + 2 * APRON;
+    VEC2 values[PADDED_SIZE];
+
+    ivec2 local_coord = ivec2(8 * (local_index % 4u), local_index / 4u);
+
+    for (int i = 0; i < PADDED_SIZE; i += 2)
+    {
+        VEC2 v0 = load_shared(local_coord.y, local_coord.x + i + 0);
+        VEC2 v1 = load_shared(local_coord.y, local_coord.x + i + 1);
+        values[i + 0] = v0 * K;
+        values[i + 1] = v1 * inv_K;
+    }
+
+    // CDF 9/7 lifting steps.
+    for (int i = 2; i < PADDED_SIZE - 1; i += 2)
+        values[i] -= DELTA * (values[i - 1] + values[i + 1]);
+    for (int i = 3; i < PADDED_SIZE - 2; i += 2)
+        values[i] -= GAMMA * (values[i - 1] + values[i + 1]);
+    for (int i = 4; i < PADDED_SIZE - 3; i += 2)
+        values[i] -= BETA * (values[i - 1] + values[i + 1]);
+    for (int i = 5; i < PADDED_SIZE - 4; i += 2)
+        values[i] -= ALPHA * (values[i - 1] + values[i + 1]);
+
+    // 4x4 subgroup transpose across the 4 X-chunk lanes so imageStore writes
+    // contiguous 4x8 quads (8x16 pixels) per 32-thread subgroup with no barriers.
+#if PRECISION == 2
+#define QUAD_T vec4
+    QUAD_T q0 = vec4(values[4].x, values[5].x, values[4].y, values[5].y);
+    QUAD_T q1 = vec4(values[6].x, values[7].x, values[6].y, values[7].y);
+    QUAD_T q2 = vec4(values[8].x, values[9].x, values[8].y, values[9].y);
+    QUAD_T q3 = vec4(values[10].x, values[11].x, values[10].y, values[11].y);
+#else
+#define QUAD_T uvec2
+    QUAD_T q0 = pack_output_quad(values[4], values[5]);
+    QUAD_T q1 = pack_output_quad(values[6], values[7]);
+    QUAD_T q2 = pack_output_quad(values[8], values[9]);
+    QUAD_T q3 = pack_output_quad(values[10], values[11]);
+#endif
+
+    uint c = local_index & 3u;
+    bool b0 = (c & 1u) != 0u;
+    bool b1 = (c & 2u) != 0u;
+    {
+        QUAD_T s0 = subgroupShuffleXor(b0 ? q0 : q1, 1u);
+        QUAD_T s1 = subgroupShuffleXor(b0 ? q2 : q3, 1u);
+        if (b0) { q0 = s0; q2 = s1; } else { q1 = s0; q3 = s1; }
+    }
+    {
+        QUAD_T t0 = subgroupShuffleXor(b1 ? q0 : q2, 2u);
+        QUAD_T t1 = subgroupShuffleXor(b1 ? q1 : q3, 2u);
+        if (b1) { q0 = t0; q1 = t1; } else { q2 = t0; q3 = t1; }
+    }
+    ivec2 wg = workgroup_xy();
+#if PACKED_OUTPUT
+    ivec2 base = BLOCK_SIZE_HALF * wg.yx + ivec2(int(c), local_coord.y);
+#if PRECISION == 2
+    imageStore(uOutput, base + ivec2(0, 0), q0);
+    imageStore(uOutput, base + ivec2(4, 0), q1);
+    imageStore(uOutput, base + ivec2(8, 0), q2);
+    imageStore(uOutput, base + ivec2(12, 0), q3);
+#else
+    imageStore(uOutput, base + ivec2(0, 0), vec4(unpackHalf2x16(q0.x), unpackHalf2x16(q0.y)));
+    imageStore(uOutput, base + ivec2(4, 0), vec4(unpackHalf2x16(q1.x), unpackHalf2x16(q1.y)));
+    imageStore(uOutput, base + ivec2(8, 0), vec4(unpackHalf2x16(q2.x), unpackHalf2x16(q2.y)));
+    imageStore(uOutput, base + ivec2(12, 0), vec4(unpackHalf2x16(q3.x), unpackHalf2x16(q3.y)));
+#endif
+#else
+    int base_x = BLOCK_SIZE * wg.y + 2 * int(c);
+    int base_y = BLOCK_SIZE * wg.x + 2 * local_coord.y;
+    int n_quads = 4 + min(resolution.x, 0);
+    [[dont_unroll]]
+    for (int s = 0; s < n_quads; s++)
+    {
+        QUAD_T q = (s == 0) ? q0 : ((s == 1) ? q1 : ((s == 2) ? q2 : q3));
+        int ox = base_x + 8 * s;
+#if PRECISION == 2
+        store_output_pair(ox, base_y + 0, q.xy);
+        store_output_pair(ox, base_y + 1, q.zw);
+#else
+        store_output_pair(ox, base_y + 0, VEC2(unpackHalf2x16(q.x)));
+        store_output_pair(ox, base_y + 1, VEC2(unpackHalf2x16(q.y)));
+#endif
+    }
+#endif
+#undef QUAD_T
+}
+
 void main()
 {
     local_index = gl_LocalInvocationIndex;
-    ivec2 wg = workgroup_xy();
 
-    load_image_with_apron(wg);
+    load_image_with_apron(workgroup_xy());
 
     // Horizontal transform.
     inverse_transform8x2();
@@ -456,37 +571,6 @@ void main()
 
     barrier();
 
-    // Vertical transform.
-    inverse_transform8x2();
-
-    barrier();
-
-    ivec2 local_coord = unswizzle8x8(local_index);
-
-#if PACKED_OUTPUT
-    for (int y = local_coord.y; y < BLOCK_SIZE_HALF; y += 8)
-    {
-        for (int qy = local_coord.x; qy < BLOCK_SIZE_HALF; qy += 8)
-        {
-            VEC2 v0 = load_shared(y, 2 * qy + 0);
-            VEC2 v1 = load_shared(y, 2 * qy + 1);
-            imageStore(uOutput, ivec2(y, qy) + BLOCK_SIZE_HALF * wg.yx,
-                       vec4(v0.x, v0.y, v1.x, v1.y));
-        }
-    }
-#else
-    for (int y = local_coord.y; y < BLOCK_SIZE_HALF; y += 8)
-    {
-        for (int x = local_coord.x; x < BLOCK_SIZE; x += 8)
-        {
-            VEC2 v = load_shared(y, x);
-            if (DCShift)
-                v += FLOAT(0.5);
-            if (RangeScale != 1.0)
-                v = clamp(v, FLOAT(0.0), FLOAT(1.0)) * FLOAT(RangeScale);
-            imageStore(uOutput, ivec2(2 * y + 0, x) + BLOCK_SIZE * wg.yx, v.xxxx);
-            imageStore(uOutput, ivec2(2 * y + 1, x) + BLOCK_SIZE * wg.yx, v.yyyy);
-        }
-    }
-#endif
+    // Vertical transform + coalesced subgroup-transposed direct store.
+    inverse_transform8x2_and_store();
 }
