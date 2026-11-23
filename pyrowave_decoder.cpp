@@ -69,7 +69,7 @@ struct Decoder::Impl final : public WaveletBuffers
 {
 	static constexpr uint32_t kUmaRingSlots = 4;
 
-	BufferHandle dequant_offset_buffer, payload_data, edge_wg_list_buffer;
+	BufferHandle dequant_offset_buffer, payload_data, edge_wg_list_buffer, active_blocks_buffer;
 	BufferViewHandle payload_u32_view, payload_u16_view, payload_u8_view;
 
 	// Ring-buffered zero-copy UMA upload buffers (used when !use_readonly_texel_buffer and UMA heap is present).
@@ -78,6 +78,7 @@ struct Decoder::Impl final : public WaveletBuffers
 	uint32_t uma_slot = 0;
 	BufferHandle uma_dequant_offset[kUmaRingSlots];
 	BufferHandle uma_payload_data[kUmaRingSlots];
+	BufferHandle uma_active_blocks[kUmaRingSlots];
 	uint32_t *uma_payload_write_ptr = nullptr;
 	size_t uma_payload_written_words = 0;
 	size_t uma_payload_cap_words = 0;
@@ -94,6 +95,15 @@ struct Decoder::Impl final : public WaveletBuffers
 	std::vector<uint32_t> payload_data_cpu;
 	// Per-block lookup packed as (level << 4) | (component << 2) | band for O(1) active tracking.
 	std::vector<uint8_t> block_to_comp_level_band;
+	// Per-block packed (bx | (by << 12) | (band << 24)) for packed 1D active-block dequant dispatch.
+	std::vector<uint32_t> block_dequant_coord;
+	struct ActiveBlockEntry
+	{
+		uint32_t coord;
+		uint32_t offset;
+	};
+	std::vector<ActiveBlockEntry> active_block_list[NumComponents][DecompositionLevels];
+	uint32_t active_block_offset[NumComponents][DecompositionLevels] = {};
 	uint8_t active_band_mask[NumComponents][DecompositionLevels] = {};
 	uint32_t active_hf_blocks[NumComponents][DecompositionLevels] = {};
 	struct IdwtLevelLayout
@@ -395,6 +405,37 @@ bool Decoder::Impl::upload_payload_uma(CommandBuffer &cmd)
 		device->unmap_host_buffer(*offset_buf, MEMORY_ACCESS_WRITE_BIT, 0, offset_size);
 	}
 
+	if (packed_2x2_wavelets && uma_active_blocks[uma_slot])
+	{
+		uint32_t total_entries = 0;
+		for (int l = 0; l < DecompositionLevels - 1; l++)
+			for (int c = 0; c < NumComponents; c++)
+				total_entries += active_hf_blocks[c][l];
+
+		if (total_entries > 0)
+		{
+			auto *dst = static_cast<ActiveBlockEntry *>(device->map_host_buffer(*uma_active_blocks[uma_slot], MEMORY_ACCESS_WRITE_BIT));
+			if (!dst)
+				return false;
+			uint32_t entry_offset = 0;
+			for (int l = 0; l < DecompositionLevels - 1; l++)
+			{
+				for (int c = 0; c < NumComponents; c++)
+				{
+					active_block_offset[c][l] = entry_offset;
+					const uint32_t count = active_hf_blocks[c][l];
+					if (count > 0)
+					{
+						memcpy(dst + entry_offset, active_block_list[c][l].data(), count * sizeof(ActiveBlockEntry));
+						entry_offset += count;
+					}
+				}
+			}
+			device->unmap_host_buffer(*uma_active_blocks[uma_slot], MEMORY_ACCESS_WRITE_BIT,
+			                          0, VkDeviceSize(total_entries) * sizeof(ActiveBlockEntry));
+		}
+	}
+
 	return true;
 }
 
@@ -475,7 +516,11 @@ bool Decoder::Impl::decode_packet(const BitstreamHeader *header)
 		const uint8_t bnd = clb & 3u;
 		active_band_mask[comp][lvl] |= uint8_t(1u << bnd);
 		if (bnd != 0)
-			active_hf_blocks[comp][lvl]++;
+		{
+			const uint32_t idx = active_hf_blocks[comp][lvl]++;
+			if (packed_2x2_wavelets && lvl < DecompositionLevels - 1)
+				active_block_list[comp][lvl][idx] = { block_dequant_coord[header->block_index], offset };
+		}
 	}
 	else
 	{
@@ -632,6 +677,19 @@ void Decoder::Impl::init_block_meta()
 			if (uma_dequant_offset[i])
 				device->set_name(*uma_dequant_offset[i], "meta-buffer-uma");
 		}
+		if (packed_2x2_wavelets)
+		{
+			BufferCreateInfo ab_info;
+			ab_info.size = std::max<VkDeviceSize>(64, VkDeviceSize(block_count_32x32) * 2 * sizeof(uint32_t));
+			ab_info.domain = uma_domain;
+			ab_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+			for (uint32_t i = 0; i < kUmaRingSlots; i++)
+			{
+				uma_active_blocks[i] = device->create_buffer(ab_info);
+				if (uma_active_blocks[i])
+					device->set_name(*uma_active_blocks[i], "active-blocks-uma");
+			}
+		}
 		LOGI("Using UMA zero-copy ring-buffered uploads.\n");
 	}
 	else
@@ -640,6 +698,16 @@ void Decoder::Impl::init_block_meta()
 		info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 		dequant_offset_buffer = device->create_buffer(info);
 		device->set_name(*dequant_offset_buffer, "meta-buffer");
+		if (packed_2x2_wavelets)
+		{
+			BufferCreateInfo ab_info;
+			ab_info.size = std::max<VkDeviceSize>(64, VkDeviceSize(block_count_32x32) * 2 * sizeof(uint32_t));
+			ab_info.domain = BufferDomain::Device;
+			ab_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+			active_blocks_buffer = device->create_buffer(ab_info);
+			if (active_blocks_buffer)
+				device->set_name(*active_blocks_buffer, "active-blocks");
+		}
 	}
 
 	const auto &feats = device->get_device_features();
@@ -667,6 +735,7 @@ void Decoder::Impl::init_block_meta()
 
 	dequant_offset_buffer_cpu.resize(block_count_32x32);
 	block_to_comp_level_band.assign(block_count_32x32, 0);
+	block_dequant_coord.assign(block_count_32x32, 0);
 	for (int level = 0; level < DecompositionLevels; level++)
 	{
 		for (int component = 0; component < NumComponents; component++)
@@ -674,13 +743,24 @@ void Decoder::Impl::init_block_meta()
 			if (level == 0 && component != 0 && chroma == ChromaSubsampling::Chroma420)
 				continue;
 			int first_band = level == DecompositionLevels - 1 ? 0 : 1;
+			size_t total_level_blocks = 0;
 			for (int band = first_band; band < 4; band++)
 			{
 				const auto &m = block_meta[component][level][band];
+				total_level_blocks += size_t(m.block_count_32x32);
 				uint8_t clb = uint8_t((level << 4) | (component << 2) | band);
+				const int stride = std::max(1, m.block_stride_32x32);
 				for (int i = 0; i < m.block_count_32x32; i++)
+				{
 					block_to_comp_level_band[m.block_offset_32x32 + i] = clb;
+					const uint32_t bx = uint32_t(i % stride);
+					const uint32_t by = uint32_t(i / stride);
+					block_dequant_coord[m.block_offset_32x32 + i] =
+						(bx & 0xfffu) | ((by & 0xfffu) << 12) | (uint32_t(band) << 24);
+				}
 			}
+			if (packed_2x2_wavelets && level < DecompositionLevels - 1)
+				active_block_list[component][level].resize(total_level_blocks);
 		}
 	}
 
@@ -774,13 +854,24 @@ bool Decoder::Impl::dequant(CommandBuffer &cmd)
 			push.resolution.x = int32_t(get_level_width(level));
 			push.resolution.y = int32_t(get_level_height(level));
 			push.output_layer = first_band;
-			push.block_offset_32x32 = block_meta[component][level][first_band].block_offset_32x32;
+			push.block_offset_32x32 = is_packed ? int32_t(active_block_offset[component][level])
+			                                    : block_meta[component][level][first_band].block_offset_32x32;
 			push.block_stride_32x32 = block_meta[component][level][first_band].block_stride_32x32;
 			push.band_stride_32x32 = block_meta[component][level][first_band].block_count_32x32;
 			cmd.push_constants(&push, 0, sizeof(push));
 
 			cmd.set_storage_texture(0, 0, *component_layer_views[component][level]);
-			cmd.set_storage_buffer(0, 1, *active_dequant_offset);
+			if (is_packed)
+			{
+				const Buffer *active_blocks_buf = use_uma_upload ? uma_active_blocks[uma_slot].get() : active_blocks_buffer.get();
+				if (!active_blocks_buf)
+					return false;
+				cmd.set_storage_buffer(0, 1, *active_blocks_buf);
+			}
+			else
+			{
+				cmd.set_storage_buffer(0, 1, *active_dequant_offset);
+			}
 
 			if (payload_r8_image && payload_r16_image && payload_r32_image)
 			{
@@ -797,7 +888,10 @@ bool Decoder::Impl::dequant(CommandBuffer &cmd)
 			else
 				cmd.set_storage_buffer(0, 2, *active_payload_data);
 
-			cmd.dispatch((push.resolution.x + 31) / 32, (push.resolution.y + 31) / 32, 4 - first_band);
+			if (is_packed)
+				cmd.dispatch(act_hf, 1, 1);
+			else
+				cmd.dispatch((push.resolution.x + 31) / 32, (push.resolution.y + 31) / 32, 4 - first_band);
 
 			cmd.end_region();
 		}
@@ -1463,6 +1557,34 @@ bool Decoder::Impl::decode(CommandBuffer &cmd, const ViewBuffers &views)
 			                         dequant_offset_buffer_cpu.size() * sizeof(dequant_offset_buffer_cpu.front())),
 			       dequant_offset_buffer_cpu.data(), dequant_offset_buffer_cpu.size() * sizeof(dequant_offset_buffer_cpu.front()));
 
+			if (packed_2x2_wavelets && active_blocks_buffer)
+			{
+				uint32_t total_entries = 0;
+				for (int l = 0; l < DecompositionLevels - 1; l++)
+					for (int c = 0; c < NumComponents; c++)
+						total_entries += active_hf_blocks[c][l];
+
+				if (total_entries > 0)
+				{
+					auto *dst = static_cast<ActiveBlockEntry *>(cmd.update_buffer(*active_blocks_buffer, 0,
+					                                                              VkDeviceSize(total_entries) * sizeof(ActiveBlockEntry)));
+					uint32_t entry_offset = 0;
+					for (int l = 0; l < DecompositionLevels - 1; l++)
+					{
+						for (int c = 0; c < NumComponents; c++)
+						{
+							active_block_offset[c][l] = entry_offset;
+							const uint32_t count = active_hf_blocks[c][l];
+							if (count > 0)
+							{
+								memcpy(dst + entry_offset, active_block_list[c][l].data(), count * sizeof(ActiveBlockEntry));
+								entry_offset += count;
+							}
+						}
+					}
+				}
+			}
+
 			cmd.barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
 			            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
 			            VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
@@ -1500,6 +1622,7 @@ void Decoder::Impl::clear()
 	std::fill(dequant_offset_buffer_cpu.begin(), dequant_offset_buffer_cpu.end(), UINT32_MAX);
 	memset(active_band_mask, 0, sizeof(active_band_mask));
 	memset(active_hf_blocks, 0, sizeof(active_hf_blocks));
+	memset(active_block_offset, 0, sizeof(active_block_offset));
 	decoded_blocks = 0;
 	last_seq = UINT32_MAX;
 	decoded_frame_for_current_sequence = false;

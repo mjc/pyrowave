@@ -21,10 +21,17 @@ layout(local_size_x = 128) in;
 
 layout(set = 0, binding = 0) writeonly uniform image2DArray uDequantImg;
 
+#if PACKED_2X2
+layout(set = 0, binding = 1) readonly buffer ActiveBlocks
+{
+    uvec2 data[];
+} active_blocks;
+#else
 layout(set = 0, binding = 1) readonly buffer PayloadOffsets
 {
     uint data[];
 } payload_offsets;
+#endif
 
 #if STORAGE_MODE == 0
 layout(set = 0, binding = 2) readonly buffer Payloads
@@ -319,12 +326,6 @@ void main()
 {
     uint local_index = gl_SubgroupID * gl_SubgroupSize + gl_SubgroupInvocationID;
 
-    int block_index_32x32 = int(registers.block_offset_32x32 +
-        gl_WorkGroupID.z * registers.band_stride_32x32 +
-        gl_WorkGroupID.y * registers.block_stride_32x32 +
-        gl_WorkGroupID.x);
-    int output_layer = registers.output_layer + int(gl_WorkGroupID.z);
-
     uint block_local_index = bitfieldExtract(local_index, 0, 3);
     uint block_x = bitfieldExtract(local_index, 3, 2);
     uint block_y = bitfieldExtract(local_index, 5, 2);
@@ -332,6 +333,19 @@ void main()
 
     // Each thread individually decodes 8 values.
     ivec2 local_coord = unswizzle8x8(block_local_index << 3);
+
+#if PACKED_2X2
+    uvec2 entry = active_blocks.data[uint(registers.block_offset_32x32) + gl_WorkGroupID.x];
+    ivec2 wg_xy = ivec2(int(entry.x & 0xfffu), int((entry.x >> 12) & 0xfffu));
+    int output_layer = int(entry.x >> 24);
+    uint offset_u32 = entry.y;
+    ivec2 coord = wg_xy * 32 + 8 * ivec2(block_x, block_y) + local_coord;
+#else
+    int block_index_32x32 = int(registers.block_offset_32x32 +
+        gl_WorkGroupID.z * registers.band_stride_32x32 +
+        gl_WorkGroupID.y * registers.block_stride_32x32 +
+        gl_WorkGroupID.x);
+    int output_layer = registers.output_layer + int(gl_WorkGroupID.z);
 
     ivec2 coord = ivec2(gl_WorkGroupID.xy) * 32;
     coord += 8 * ivec2(block_x, block_y);
@@ -341,13 +355,12 @@ void main()
 
     if (offset_u32 == ~0u)
     {
-#if !PACKED_2X2
         for (int j = 0; j < 2; j++)
             for (int i = 0; i < 4; i++)
                 imageStore(uDequantImg, ivec3(coord + ivec2(i, j), output_layer), vec4(0.0));
-#endif
         return;
     }
+#endif
 
 #if STORAGE_MODE == 0 || STORAGE_MODE == 3
     uint ballot = payload_data_u32.data[offset_u32] & 0xffffu;
