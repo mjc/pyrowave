@@ -74,12 +74,15 @@ struct Decoder::Impl final : public WaveletBuffers
 
 	// Ring-buffered zero-copy UMA upload buffers (used when !use_readonly_texel_buffer and UMA heap is present).
 	bool use_uma_upload = false;
+	bool uma_offset_direct = false;
+	bool uma_offset_synced_to_cpu = false;
 	BufferDomain uma_domain = BufferDomain::LinkedDeviceHost;
 	uint32_t uma_slot = 0;
 	BufferHandle uma_dequant_offset[kUmaRingSlots];
 	BufferHandle uma_payload_data[kUmaRingSlots];
 	BufferHandle uma_active_blocks[kUmaRingSlots];
 	uint32_t *uma_payload_write_ptr = nullptr;
+	uint32_t *uma_offset_write_ptr = nullptr;
 	size_t uma_payload_written_words = 0;
 	size_t uma_payload_cap_words = 0;
 	bool uma_slot_submitted = false;
@@ -227,6 +230,11 @@ void Decoder::Impl::discard_uma_payload_write()
 		device->unmap_host_buffer(*uma_payload_data[uma_slot], MEMORY_ACCESS_WRITE_BIT);
 		uma_payload_write_ptr = nullptr;
 	}
+	if (uma_offset_write_ptr && uma_dequant_offset[uma_slot])
+	{
+		device->unmap_host_buffer(*uma_dequant_offset[uma_slot], MEMORY_ACCESS_WRITE_BIT);
+		uma_offset_write_ptr = nullptr;
+	}
 	uma_payload_written_words = 0;
 	uma_payload_cap_words = 0;
 }
@@ -240,17 +248,22 @@ void Decoder::Impl::begin_uma_payload_write()
 		uma_submitted_bytes = 0;
 	}
 
-	if (uma_payload_write_ptr && uma_payload_data[uma_slot])
-	{
-		uma_payload_written_words = 0;
-		uma_payload_cap_words = size_t(uma_payload_data[uma_slot]->get_create_info().size / sizeof(uint32_t));
-		return;
-	}
-
 	uma_payload_written_words = 0;
 	uma_payload_cap_words = 0;
 	if (!use_uma_upload)
 		return;
+
+	if (uma_offset_direct && !uma_offset_write_ptr && uma_dequant_offset[uma_slot])
+	{
+		uma_offset_write_ptr = static_cast<uint32_t *>(device->map_host_buffer(
+			*uma_dequant_offset[uma_slot], MEMORY_ACCESS_READ_BIT | MEMORY_ACCESS_WRITE_BIT));
+	}
+
+	if (uma_payload_write_ptr && uma_payload_data[uma_slot])
+	{
+		uma_payload_cap_words = size_t(uma_payload_data[uma_slot]->get_create_info().size / sizeof(uint32_t));
+		return;
+	}
 
 	auto &payload_buf = uma_payload_data[uma_slot];
 	if (!payload_buf)
@@ -291,6 +304,7 @@ bool Decoder::Impl::upload_payload_uma(CommandBuffer &cmd)
 		if (tail_size == 0 && uma_payload_data[prev_slot])
 		{
 			uma_slot = prev_slot;
+			return true;
 		}
 		else
 		{
@@ -395,14 +409,22 @@ bool Decoder::Impl::upload_payload_uma(CommandBuffer &cmd)
 	if (!offset_buf)
 		return false;
 
-	VkDeviceSize offset_size = dequant_offset_buffer_cpu.size() * sizeof(dequant_offset_buffer_cpu.front());
+	VkDeviceSize offset_size = VkDeviceSize(block_count_32x32) * sizeof(uint32_t);
 	if (offset_size > 0)
 	{
-		auto *offset_dst = static_cast<uint8_t *>(device->map_host_buffer(*offset_buf, MEMORY_ACCESS_WRITE_BIT));
-		if (!offset_dst)
-			return false;
-		memcpy(offset_dst, dequant_offset_buffer_cpu.data(), offset_size);
-		device->unmap_host_buffer(*offset_buf, MEMORY_ACCESS_WRITE_BIT, 0, offset_size);
+		if (uma_offset_write_ptr)
+		{
+			device->unmap_host_buffer(*offset_buf, MEMORY_ACCESS_WRITE_BIT, 0, offset_size);
+			uma_offset_write_ptr = nullptr;
+		}
+		else
+		{
+			auto *offset_dst = static_cast<uint8_t *>(device->map_host_buffer(*offset_buf, MEMORY_ACCESS_WRITE_BIT));
+			if (!offset_dst)
+				return false;
+			memcpy(offset_dst, dequant_offset_buffer_cpu.data(), offset_size);
+			device->unmap_host_buffer(*offset_buf, MEMORY_ACCESS_WRITE_BIT, 0, offset_size);
+		}
 	}
 
 	if (packed_2x2_wavelets && uma_active_blocks[uma_slot])
@@ -550,6 +572,26 @@ bool Decoder::Impl::decode_packet(const BitstreamHeader *header)
 bool Decoder::Impl::push_packet(const void *data_, size_t size)
 {
 	auto *data = static_cast<const uint8_t *>(data_);
+
+	const auto ensure_offset_table = [&]() -> uint32_t * {
+		if (uma_offset_write_ptr)
+			return uma_offset_write_ptr;
+		if (uma_offset_direct && uma_slot_submitted && !uma_offset_synced_to_cpu && uma_dequant_offset[uma_submitted_slot])
+		{
+			auto *prev = static_cast<const uint32_t *>(device->map_host_buffer(
+				*uma_dequant_offset[uma_submitted_slot], MEMORY_ACCESS_READ_BIT));
+			if (prev)
+			{
+				memcpy(dequant_offset_buffer_cpu.data(), prev, size_t(block_count_32x32) * sizeof(uint32_t));
+				device->unmap_host_buffer(*uma_dequant_offset[uma_submitted_slot], MEMORY_ACCESS_READ_BIT);
+			}
+			uma_offset_synced_to_cpu = true;
+		}
+		return dequant_offset_buffer_cpu.data();
+	};
+
+	uint32_t *offset_table = ensure_offset_table();
+
 	while (size >= sizeof(BitstreamHeader))
 	{
 		auto *header = reinterpret_cast<const BitstreamHeader *>(data);
@@ -580,6 +622,7 @@ bool Decoder::Impl::push_packet(const void *data_, size_t size)
 			{
 				clear();
 				last_seq = header->sequence;
+				offset_table = ensure_offset_table();
 			}
 
 			if (seq->code == BITSTREAM_EXTENDED_CODE_START_OF_FRAME)
@@ -605,7 +648,8 @@ bool Decoder::Impl::push_packet(const void *data_, size_t size)
 			continue;
 		}
 
-		size_t packet_size = header->payload_words * sizeof(uint32_t);
+		const uint32_t pwords = header->payload_words;
+		size_t packet_size = size_t(pwords) * sizeof(uint32_t);
 
 		if (packet_size > size)
 		{
@@ -633,6 +677,7 @@ bool Decoder::Impl::push_packet(const void *data_, size_t size)
 		{
 			clear();
 			last_seq = header->sequence;
+			offset_table = ensure_offset_table();
 		}
 
 		if (header->block_index >= uint32_t(block_count_32x32))
@@ -641,8 +686,44 @@ bool Decoder::Impl::push_packet(const void *data_, size_t size)
 			return false;
 		}
 
-		if (!decode_packet(header))
+		if (sizeof(*header) / sizeof(uint32_t) > pwords)
+		{
+			LOGE("payload_words is not large enough.\n");
 			return false;
+		}
+
+		auto &offset = offset_table[header->block_index];
+		if (offset == UINT32_MAX)
+		{
+			const uint32_t block_offset = uint32_t(uma_payload_written_words + payload_data_cpu.size());
+			decoded_blocks++;
+			offset = block_offset;
+			const uint8_t clb = block_to_comp_level_band[header->block_index];
+			const uint8_t comp = (clb >> 2) & 3u;
+			const uint8_t lvl = clb >> 4;
+			const uint8_t bnd = clb & 3u;
+			active_band_mask[comp][lvl] |= uint8_t(1u << bnd);
+			if (bnd != 0)
+			{
+				const uint32_t idx = active_hf_blocks[comp][lvl]++;
+				if (packed_2x2_wavelets && lvl < DecompositionLevels - 1)
+					active_block_list[comp][lvl][idx] = { block_dequant_coord[header->block_index], block_offset };
+			}
+
+			if (uma_payload_write_ptr &&
+			    !uma_slot_submitted &&
+			    payload_data_cpu.empty() &&
+			    uma_payload_written_words + pwords + 4 <= uma_payload_cap_words)
+			{
+				memcpy(uma_payload_write_ptr + uma_payload_written_words, data, packet_size);
+				uma_payload_written_words += pwords;
+			}
+			else
+			{
+				const auto *payload_words = reinterpret_cast<const uint32_t *>(data);
+				payload_data_cpu.insert(payload_data_cpu.end(), payload_words, payload_words + pwords);
+			}
+		}
 
 		data += packet_size;
 		size -= packet_size;
@@ -664,6 +745,7 @@ void Decoder::Impl::init_block_meta()
 	// Enable UMA zero-copy ring-buffered uploads only on SSBO paths (STORAGE_MODE 0 or 3)
 	// so we never alias host-visible memory with linear 2D payload images.
 	use_uma_upload = !use_readonly_texel_buffer && select_uma_buffer_domain(*device, uma_domain);
+	uma_offset_direct = use_uma_upload && (uma_domain == BufferDomain::UMACachedCoherentPreferDevice);
 
 	BufferCreateInfo info;
 	info.size = block_count_32x32 * sizeof(uint32_t);
@@ -805,7 +887,9 @@ bool Decoder::Impl::dequant(CommandBuffer &cmd)
 	else
 		storage_mode = 0;
 
-	cmd.begin_region("DWT dequant");
+	const bool debug_labels = device->get_device_features().supports_debug_utils;
+	if (debug_labels)
+		cmd.begin_region("DWT dequant");
 	auto start_dequant = cmd.write_timestamp(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
 	cmd.image_barrier(*wavelet_img_high_res, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
@@ -846,9 +930,12 @@ bool Decoder::Impl::dequant(CommandBuffer &cmd)
 			if (is_packed && act_hf == 0)
 				continue;
 
-			char label[128];
-			snprintf(label, sizeof(label), "level %d - component %d", level, component);
-			cmd.begin_region(label);
+			if (debug_labels)
+			{
+				char label[128];
+				snprintf(label, sizeof(label), "level %d - component %d", level, component);
+				cmd.begin_region(label);
+			}
 
 			int first_band = level == DecompositionLevels - 1 ? 0 : 1;
 			push.resolution.x = int32_t(get_level_width(level));
@@ -893,7 +980,8 @@ bool Decoder::Impl::dequant(CommandBuffer &cmd)
 			else
 				cmd.dispatch((push.resolution.x + 31) / 32, (push.resolution.y + 31) / 32, 4 - first_band);
 
-			cmd.end_region();
+			if (debug_labels)
+				cmd.end_region();
 		}
 	}
 
@@ -902,7 +990,8 @@ bool Decoder::Impl::dequant(CommandBuffer &cmd)
 	            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
 
 	auto end_dequant = cmd.write_timestamp(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-	cmd.end_region();
+	if (debug_labels)
+		cmd.end_region();
 	cmd.enable_subgroup_size_control(false);
 	device->register_time_interval("GPU", std::move(start_dequant), std::move(end_dequant), "Dequant");
 
@@ -1399,24 +1488,31 @@ bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 			}
 		};
 
+		const bool debug_labels = device->get_device_features().supports_debug_utils;
 		if (input_level == 0)
 		{
 			if (chroma == ChromaSubsampling::Chroma444)
 			{
 				for (int c = 0; c < NumComponents; c++)
 				{
-					char label[64];
-					snprintf(label, sizeof(label), "iDWT final, component %u", c);
-					cmd.begin_region(label);
+					if (debug_labels)
+					{
+						char label[64];
+						snprintf(label, sizeof(label), "iDWT final, component %u", c);
+						cmd.begin_region(label);
+					}
 					dispatch_component(c, true, *views.planes[c]);
-					cmd.end_region();
+					if (debug_labels)
+						cmd.end_region();
 				}
 			}
 			else
 			{
-				cmd.begin_region("iDWT final");
+				if (debug_labels)
+					cmd.begin_region("iDWT final");
 				dispatch_component(0, true, *views.planes[0]);
-				cmd.end_region();
+				if (debug_labels)
+					cmd.end_region();
 			}
 		}
 		else
@@ -1426,11 +1522,15 @@ bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 				const bool is_final_chroma = chroma == ChromaSubsampling::Chroma420 && c != 0 && input_level == 1;
 				const ImageView &dst = is_final_chroma ? *views.planes[c] : *component_ll_views[c][input_level - 1];
 
-				char label[64];
-				snprintf(label, sizeof(label), "iDWT level %u, component %u", input_level - 1, c);
-				cmd.begin_region(label);
+				if (debug_labels)
+				{
+					char label[64];
+					snprintf(label, sizeof(label), "iDWT level %u, component %u", input_level - 1, c);
+					cmd.begin_region(label);
+				}
 				dispatch_component(c, is_final_chroma, dst);
-				cmd.end_region();
+				if (debug_labels)
+					cmd.end_region();
 			}
 		}
 
@@ -1459,9 +1559,10 @@ bool Decoder::Impl::has_pristine_bands(int bands, const uint32_t *active_block_m
 	// TODO: It's possible to improve this by sending the "active block mask"
 	// as sideband data from encoder if need be.
 
+	const uint32_t *offset_table = uma_offset_write_ptr ? uma_offset_write_ptr : dequant_offset_buffer_cpu.data();
 	const auto block_is_missing = [&](uint32_t block_index)
 	{
-		if (dequant_offset_buffer_cpu[block_index] != UINT32_MAX)
+		if (offset_table[block_index] != UINT32_MAX)
 			return false;
 
 		uint32_t word_index = block_index / 32;
@@ -1619,7 +1720,12 @@ bool Decoder::Impl::decode(CommandBuffer &cmd, const ViewBuffers &views)
 
 void Decoder::Impl::clear()
 {
-	std::fill(dequant_offset_buffer_cpu.begin(), dequant_offset_buffer_cpu.end(), UINT32_MAX);
+	begin_uma_payload_write();
+	uma_offset_synced_to_cpu = false;
+	if (uma_offset_write_ptr)
+		memset(uma_offset_write_ptr, 0xff, size_t(block_count_32x32) * sizeof(uint32_t));
+	else
+		memset(dequant_offset_buffer_cpu.data(), 0xff, dequant_offset_buffer_cpu.size() * sizeof(uint32_t));
 	memset(active_band_mask, 0, sizeof(active_band_mask));
 	memset(active_hf_blocks, 0, sizeof(active_hf_blocks));
 	memset(active_block_offset, 0, sizeof(active_block_offset));
@@ -1628,7 +1734,6 @@ void Decoder::Impl::clear()
 	decoded_frame_for_current_sequence = false;
 	total_blocks_in_sequence = block_count_32x32;
 	payload_data_cpu.clear();
-	begin_uma_payload_write();
 }
 
 bool Decoder::device_prefers_fragment_path(Vulkan::Device &device)
