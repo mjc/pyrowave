@@ -12,6 +12,7 @@
 #include "slangmosh_scaler.hpp"
 #include "scaler.hpp"
 #include "thread_id.hpp"
+#include <new>
 
 using namespace Granite;
 using namespace Vulkan;
@@ -1818,11 +1819,48 @@ bool pyrowave_decoder_decode_is_ready_with_sideband(pyrowave_decoder decoder, bo
 	                                        active_block_mask, word_count);
 }
 
+struct pyrowave_decode_target_opaque
+{
+	pyrowave_decoder decoder;
+	WrappedViewBuffers views;
+};
+
+static VkImageUsageFlags decode_target_usage(pyrowave_decoder decoder)
+{
+	return decoder->fragment_path ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : VK_IMAGE_USAGE_STORAGE_BIT;
+}
+
 pyrowave_result
-pyrowave_decoder_decode_gpu_buffer(pyrowave_decoder decoder,
-                                   const pyrowave_gpu_sync_operation *acquire,
-                                   const pyrowave_gpu_sync_operation *release,
-                                   const pyrowave_gpu_buffers *buffers)
+pyrowave_decode_target_create(pyrowave_decoder decoder, const pyrowave_gpu_buffers *buffers,
+                              pyrowave_decode_target *target)
+{
+	if (!decoder || !buffers || !target)
+		return PYROWAVE_ERROR_INVALID_ARGUMENT;
+
+	*target = nullptr;
+	auto *prepared = new (std::nothrow) pyrowave_decode_target_opaque{};
+	if (!prepared)
+		return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
+	prepared->decoder = decoder;
+	if (!prepared->views.wrap(decoder->device, buffers, decode_target_usage(decoder)))
+	{
+		delete prepared;
+		return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
+	}
+	*target = prepared;
+	return PYROWAVE_SUCCESS;
+}
+
+void pyrowave_decode_target_destroy(pyrowave_decode_target target)
+{
+	delete target;
+}
+
+static pyrowave_result decode_gpu_views(pyrowave_decoder decoder,
+                                       const pyrowave_gpu_sync_operation *acquire,
+                                       const pyrowave_gpu_sync_operation *release,
+                                       const pyrowave_gpu_buffers *buffers,
+                                       WrappedViewBuffers &views)
 {
 	if (decoder->pyro_device->cmd && (acquire || release))
 		return PYROWAVE_ERROR_INVALID_ARGUMENT;
@@ -1831,13 +1869,11 @@ pyrowave_decoder_decode_gpu_buffer(pyrowave_decoder decoder,
 		return PYROWAVE_ERROR_NOT_IMPLEMENTED;
 
 	Util::register_thread_index(0);
-
 	Util::set_thread_logging_interface(&null_logger);
 	auto *device = decoder->device;
 	device->next_frame_context();
 
-	WrappedViewBuffers views = {};
-	if (!views.wrap(device, buffers, decoder->fragment_path ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : VK_IMAGE_USAGE_STORAGE_BIT))
+	if (buffers && !views.wrap(device, buffers, decode_target_usage(decoder)))
 		return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
 	views.range_scale = decoder->ycbcr_scaling_factor;
 
@@ -1907,6 +1943,26 @@ pyrowave_decoder_decode_gpu_buffer(pyrowave_decoder decoder,
 	pyrowave_device_signal_semaphore(device, decoder->pyro_device->queue_type, release);
 
 	return PYROWAVE_SUCCESS;
+}
+
+pyrowave_result
+pyrowave_decoder_decode_gpu_buffer(pyrowave_decoder decoder,
+                                   const pyrowave_gpu_sync_operation *acquire,
+                                   const pyrowave_gpu_sync_operation *release,
+                                   const pyrowave_gpu_buffers *buffers)
+{
+	if (!buffers)
+		return PYROWAVE_ERROR_INVALID_ARGUMENT;
+	WrappedViewBuffers views = {};
+	return decode_gpu_views(decoder, acquire, release, buffers, views);
+}
+
+pyrowave_result
+pyrowave_decoder_decode_target(pyrowave_decoder decoder, pyrowave_decode_target target)
+{
+	if (!decoder || !target || target->decoder != decoder || !decoder->pyro_device->cmd)
+		return PYROWAVE_ERROR_INVALID_ARGUMENT;
+	return decode_gpu_views(decoder, nullptr, nullptr, nullptr, target->views);
 }
 
 pyrowave_result
