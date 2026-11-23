@@ -418,7 +418,8 @@ void inverse_transform8x2()
 
     ivec2 local_coord = ivec2(8 * (local_index % 4u), local_index / 4u);
 
-    for (int i = 0; i < PADDED_SIZE; i += 2)
+    values[1] = load_shared(local_coord.y, local_coord.x + 1) * inv_K;
+    for (int i = 2; i < PADDED_SIZE; i += 2)
     {
         VEC2 v0 = load_shared(local_coord.y, local_coord.x + i + 0);
         VEC2 v1 = load_shared(local_coord.y, local_coord.x + i + 1);
@@ -467,7 +468,8 @@ void inverse_transform4x2(bool active_lane, int y_offset)
 
     if (active_lane)
     {
-        for (int i = 0; i < PADDED_SIZE; i += 2)
+        values[1] = load_shared(local_coord.y, local_coord.x + 1) * inv_K;
+        for (int i = 2; i < PADDED_SIZE; i += 2)
         {
             VEC2 v0 = load_shared(local_coord.y, local_coord.x + i + 0);
             VEC2 v1 = load_shared(local_coord.y, local_coord.x + i + 1);
@@ -589,7 +591,7 @@ uvec2 pack_output_quad(VEC2 a, VEC2 b)
 }
 #endif
 
-void inverse_transform8x2_and_store()
+void inverse_transform8x2_and_store(ivec2 wg)
 {
     const int SIZE = 8;
     const int PADDED_SIZE = SIZE + 2 * APRON;
@@ -623,7 +625,8 @@ void inverse_transform8x2_and_store()
     {
         VEC2 values[PADDED_SIZE];
 
-        for (int i = 0; i < PADDED_SIZE; i += 2)
+        values[1] = load_shared(local_coord.y, local_coord.x + 1) * inv_K;
+        for (int i = 2; i < PADDED_SIZE; i += 2)
         {
             VEC2 v0 = load_shared(local_coord.y, local_coord.x + i + 0);
             VEC2 v1 = load_shared(local_coord.y, local_coord.x + i + 1);
@@ -676,7 +679,7 @@ void inverse_transform8x2_and_store()
         QUAD_T t1 = subgroupShuffleXor(b1 ? q1 : q3, 2u);
         if (b1) { q0 = t0; q1 = t1; } else { q2 = t0; q3 = t1; }
     }
-    ivec2 wg = workgroup_xy();
+
 #if PACKED_OUTPUT
     ivec2 base = BLOCK_SIZE_HALF * wg.yx + ivec2(int(c), local_coord.y);
 #if PRECISION == 2
@@ -715,7 +718,8 @@ void main()
 {
     local_index = gl_LocalInvocationIndex;
 
-    load_image_with_apron(workgroup_xy());
+    ivec2 wg = workgroup_xy();
+    load_image_with_apron(wg);
 
 #if PACKED_INPUT
     if (ActiveBandMask == 0u)
@@ -736,5 +740,5 @@ void main()
     barrier();
 
     // Vertical transform + coalesced subgroup-transposed direct store.
-    inverse_transform8x2_and_store();
+    inverse_transform8x2_and_store(wg);
 }
