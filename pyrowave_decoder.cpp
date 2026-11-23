@@ -22,24 +22,45 @@ struct DequantizerPushData
 	int32_t band_stride_32x32;
 };
 
-static bool supports_uma_upload(const Device &dev)
+static bool select_uma_buffer_domain(const Device &dev, BufferDomain &out_domain)
 {
 	const auto &mem_props = dev.get_memory_properties();
-	constexpr VkMemoryPropertyFlags required_flags =
+	constexpr VkMemoryPropertyFlags cached_flags =
+		VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+		VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+	constexpr VkMemoryPropertyFlags coherent_flags =
 		VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
 		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
 		VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 	constexpr VkDeviceSize min_uma_heap_size = 512ull * 1024ull * 1024ull;
 
+	bool has_cached = false;
+	bool has_coherent = false;
+
 	for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++)
 	{
 		const auto &type = mem_props.memoryTypes[i];
-		if ((type.propertyFlags & required_flags) == required_flags &&
-		    type.heapIndex < mem_props.memoryHeapCount &&
-		    mem_props.memoryHeaps[type.heapIndex].size >= min_uma_heap_size)
-		{
-			return true;
-		}
+		if (type.heapIndex >= mem_props.memoryHeapCount ||
+		    mem_props.memoryHeaps[type.heapIndex].size < min_uma_heap_size)
+			continue;
+
+		if ((type.propertyFlags & cached_flags) == cached_flags)
+			has_cached = true;
+		if ((type.propertyFlags & coherent_flags) == coherent_flags)
+			has_coherent = true;
+	}
+
+	if (has_cached)
+	{
+		// Prefer CPU-cached UMA memory (coherent when available, otherwise flushed via unmap_host_buffer).
+		out_domain = BufferDomain::UMACachedCoherentPreferDevice;
+		return true;
+	}
+	if (has_coherent)
+	{
+		out_domain = BufferDomain::LinkedDeviceHost;
+		return true;
 	}
 	return false;
 }
@@ -53,6 +74,7 @@ struct Decoder::Impl final : public WaveletBuffers
 
 	// Ring-buffered zero-copy UMA upload buffers (used when !use_readonly_texel_buffer and UMA heap is present).
 	bool use_uma_upload = false;
+	BufferDomain uma_domain = BufferDomain::LinkedDeviceHost;
 	uint32_t uma_slot = 0;
 	BufferHandle uma_dequant_offset[kUmaRingSlots];
 	BufferHandle uma_payload_data[kUmaRingSlots];
@@ -232,7 +254,7 @@ void Decoder::Impl::begin_uma_payload_write()
 			VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
 			VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
 			VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-		bufinfo.domain = BufferDomain::LinkedDeviceHost;
+		bufinfo.domain = uma_domain;
 		payload_buf = device->create_buffer(bufinfo);
 		if (!payload_buf)
 			return;
@@ -273,7 +295,7 @@ bool Decoder::Impl::upload_payload_uma(CommandBuffer &cmd)
 					VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
 					VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
 					VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-				bufinfo.domain = BufferDomain::LinkedDeviceHost;
+				bufinfo.domain = uma_domain;
 				dst_buf = device->create_buffer(bufinfo);
 				if (!dst_buf)
 					return false;
@@ -309,7 +331,7 @@ bool Decoder::Impl::upload_payload_uma(CommandBuffer &cmd)
 				VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
 				VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
 				VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-			bufinfo.domain = BufferDomain::LinkedDeviceHost;
+			bufinfo.domain = uma_domain;
 			BufferHandle new_buf = device->create_buffer(bufinfo);
 			if (!new_buf)
 				return false;
@@ -317,7 +339,8 @@ bool Decoder::Impl::upload_payload_uma(CommandBuffer &cmd)
 
 			if (uma_payload_write_ptr && payload_buf)
 			{
-				device->unmap_host_buffer(*payload_buf, MEMORY_ACCESS_WRITE_BIT);
+				if (direct_size > 0)
+					device->unmap_host_buffer(*payload_buf, MEMORY_ACCESS_WRITE_BIT, 0, direct_size);
 				uma_payload_write_ptr = nullptr;
 			}
 
@@ -369,7 +392,7 @@ bool Decoder::Impl::upload_payload_uma(CommandBuffer &cmd)
 		if (!offset_dst)
 			return false;
 		memcpy(offset_dst, dequant_offset_buffer_cpu.data(), offset_size);
-		device->unmap_host_buffer(*offset_buf, MEMORY_ACCESS_WRITE_BIT);
+		device->unmap_host_buffer(*offset_buf, MEMORY_ACCESS_WRITE_BIT, 0, offset_size);
 	}
 
 	return true;
@@ -595,13 +618,13 @@ void Decoder::Impl::init_block_meta()
 
 	// Enable UMA zero-copy ring-buffered uploads only on SSBO paths (STORAGE_MODE 0 or 3)
 	// so we never alias host-visible memory with linear 2D payload images.
-	use_uma_upload = !use_readonly_texel_buffer && supports_uma_upload(*device);
+	use_uma_upload = !use_readonly_texel_buffer && select_uma_buffer_domain(*device, uma_domain);
 
 	BufferCreateInfo info;
 	info.size = block_count_32x32 * sizeof(uint32_t);
 	if (use_uma_upload)
 	{
-		info.domain = BufferDomain::LinkedDeviceHost;
+		info.domain = uma_domain;
 		info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
 		for (uint32_t i = 0; i < kUmaRingSlots; i++)
 		{
