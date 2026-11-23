@@ -146,6 +146,21 @@ VEC4 fetch_quad_edge_oob(ivec2 c, bool even_x, bool even_y, int layer, uint mask
     int oy1 = mirror_1d(c.x + 1, even_x, resolution.x);
     int ox0 = mirror_1d(c.y + 0, even_y, resolution.y);
     int ox1 = mirror_1d(c.y + 1, even_y, resolution.y);
+    ivec2 q = ivec2(ox0, oy0) >> 1;
+    if (all(equal(q, ivec2(ox1, oy1) >> 1)))
+    {
+        if (MaskCheck && layer > 0 && mask != 0xfu)
+        {
+            int idx = block_offset_32x32 + (layer - 1) * band_stride_32x32 +
+                      (oy0 >> 5) * block_stride_32x32 + (ox0 >> 5);
+            if (payload_offsets.data[idx] == ~0u)
+                return VEC4(0.0);
+        }
+        vec4 texels = texelFetch(uTexture, ivec3(q, layer), 0);
+        int x0 = ox0 & 1, x1 = ox1 & 1;
+        int y0 = (oy0 & 1) * 2, y1 = (oy1 & 1) * 2;
+        return VEC4(texels[x0 + y0], texels[x0 + y1], texels[x1 + y0], texels[x1 + y1]);
+    }
     return VEC4(
         fetch_pixel_edge(ox0, oy0, layer, mask),
         fetch_pixel_edge(ox0, oy1, layer, mask),
