@@ -45,6 +45,9 @@ struct pyrowave_device_opaque
 	Device device;
 	VkCommandBuffer cmd = VK_NULL_HANDLE;
 	CommandBuffer::Type queue_type = CommandBuffer::Type::Generic;
+#ifdef __ANDROID__
+	uint64_t pipeline_cache_generation = 0;
+#endif
 };
 
 void pyrowave_device_set_command_buffer(pyrowave_device device, VkCommandBuffer cmd)
@@ -172,6 +175,12 @@ pyrowave_result pyrowave_create_default_device(pyrowave_device *device)
 
 static std::mutex global_device_lock;
 
+#ifdef __ANDROID__
+// Granite's filesystem cache is disabled in the Android library. Keep the
+// last stream's cache in memory so a reconnect can reuse its compiled pipelines.
+static std::vector<uint8_t> android_pipeline_cache;
+static uint64_t android_pipeline_cache_generation;
+#endif
 pyrowave_result pyrowave_create_device(const pyrowave_device_create_info *info, pyrowave_device *out_device)
 {
 	// TODO: Find a better way to do this.
@@ -249,6 +258,12 @@ pyrowave_result pyrowave_create_device(const pyrowave_device_create_info *info, 
 	context_opts.memory_priorities = false;
 	context_opts.lean_memory_mode = true;
 	dev->device.set_context(dev->context, context_opts);
+
+#ifdef __ANDROID__
+	if (!dev->device.get_device_features().pipeline_binary_features.pipelineBinaries &&
+	    dev->device.init_pipeline_cache(android_pipeline_cache.data(), android_pipeline_cache.size()))
+		dev->pipeline_cache_generation = ++android_pipeline_cache_generation;
+#endif
 
 	dev->device.set_queue_lock(
 		[cb = info->queue_lock_callback, userdata = info->userdata]() {
@@ -444,6 +459,22 @@ void pyrowave_device_destroy(pyrowave_device device)
 {
 	Util::set_thread_logging_interface(&null_logger);
 
+#ifdef __ANDROID__
+	if (device && device->pipeline_cache_generation != 0)
+	{
+		std::lock_guard<std::mutex> holder{global_device_lock};
+		if (device->pipeline_cache_generation == android_pipeline_cache_generation)
+		{
+			const size_t size = device->device.get_pipeline_cache_size();
+			if (size > 0 && size <= 16 * 1024 * 1024)
+			{
+				std::vector<uint8_t> cache(size);
+				if (device->device.get_pipeline_cache_data(cache.data(), cache.size()))
+					android_pipeline_cache.swap(cache);
+			}
+		}
+	}
+#endif
 	delete device;
 }
 
