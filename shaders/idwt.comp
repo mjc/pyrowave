@@ -409,6 +409,42 @@ void load_image_with_apron(ivec2 wg)
 }
 #endif
 
+void load_lifting_samples(ivec2 local_coord, out VEC2 values[16])
+{
+    const int PADDED_SIZE = 16;
+#if PACKED_INPUT && !FP16 && PRECISION == 1
+    // Adjacent chunks overlap by eight samples. Exchange the packed values
+    // before unpacking so the neighboring lane can reuse the same load.
+    if (gl_SubgroupSize == 32u)
+    {
+        uint lane = gl_SubgroupInvocationID;
+        bool last_chunk = (local_index & 3u) == 3u;
+        uint next_lane = lane + uint(!last_chunk);
+        for (int i = 0; i < 8; i++)
+        {
+            uint sample_pair = shared_block[local_coord.y][local_coord.x + i];
+            uint overlap = subgroupShuffle(sample_pair, next_lane);
+            if (last_chunk)
+                overlap = shared_block[local_coord.y][local_coord.x + i + 8];
+            FLOAT scale = (i & 1) == 0 ? K : inv_K;
+            values[i] = unpackHalf2x16(sample_pair) * scale;
+            values[i + 8] = unpackHalf2x16(overlap) * scale;
+        }
+    }
+    else
+#endif
+    {
+        values[1] = load_shared(local_coord.y, local_coord.x + 1) * inv_K;
+        for (int i = 2; i < PADDED_SIZE; i += 2)
+        {
+            VEC2 v0 = load_shared(local_coord.y, local_coord.x + i + 0);
+            VEC2 v1 = load_shared(local_coord.y, local_coord.x + i + 1);
+            values[i + 0] = v0 * K;
+            values[i + 1] = v1 * inv_K;
+        }
+    }
+}
+
 void inverse_transform8x2()
 {
     const int SIZE = 8;
@@ -418,14 +454,7 @@ void inverse_transform8x2()
 
     ivec2 local_coord = ivec2(8 * (local_index % 4u), local_index / 4u);
 
-    values[1] = load_shared(local_coord.y, local_coord.x + 1) * inv_K;
-    for (int i = 2; i < PADDED_SIZE; i += 2)
-    {
-        VEC2 v0 = load_shared(local_coord.y, local_coord.x + i + 0);
-        VEC2 v1 = load_shared(local_coord.y, local_coord.x + i + 1);
-        values[i + 0] = v0 * K;
-        values[i + 1] = v1 * inv_K;
-    }
+    load_lifting_samples(local_coord, values);
 
     // CDF 9/7 lifting steps.
     // Arith go brrr.
@@ -625,37 +654,7 @@ void inverse_transform8x2_and_store(ivec2 wg)
     {
         VEC2 values[PADDED_SIZE];
 
-#if PACKED_INPUT && !FP16 && PRECISION == 1
-        // Adjacent chunks overlap by eight samples. Exchange the packed values
-        // before unpacking so the neighboring lane can reuse the same load.
-        if (gl_SubgroupSize == 32u)
-        {
-            uint lane = gl_SubgroupInvocationID;
-            bool last_chunk = (local_index & 3u) == 3u;
-            uint next_lane = lane + uint(!last_chunk);
-            for (int i = 0; i < 8; i++)
-            {
-                uint sample_pair = shared_block[local_coord.y][local_coord.x + i];
-                uint overlap = subgroupShuffle(sample_pair, next_lane);
-                if (last_chunk)
-                    overlap = shared_block[local_coord.y][local_coord.x + i + 8];
-                FLOAT scale = (i & 1) == 0 ? K : inv_K;
-                values[i] = unpackHalf2x16(sample_pair) * scale;
-                values[i + 8] = unpackHalf2x16(overlap) * scale;
-            }
-        }
-        else
-#endif
-        {
-            values[1] = load_shared(local_coord.y, local_coord.x + 1) * inv_K;
-            for (int i = 2; i < PADDED_SIZE; i += 2)
-            {
-                VEC2 v0 = load_shared(local_coord.y, local_coord.x + i + 0);
-                VEC2 v1 = load_shared(local_coord.y, local_coord.x + i + 1);
-                values[i + 0] = v0 * K;
-                values[i + 1] = v1 * inv_K;
-            }
-        }
+        load_lifting_samples(local_coord, values);
 
         // CDF 9/7 lifting steps.
         for (int i = 2; i < PADDED_SIZE - 1; i += 2)
