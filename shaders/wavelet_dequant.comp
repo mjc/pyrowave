@@ -151,63 +151,94 @@ mat2x4 decode_payload(uint code_word, uint q_bits, uint offset, uint block_index
         bitCount(bitfieldExtract(msbs, 0, bit_offset)) +
         q_bits * block_index + offset;
 
-    int decoded_abs[8] = int[8](0, 0, 0, 0, 0, 0, 0, 0);
-
-#if STORAGE_MODE == 3
+#if STORAGE_MODE == 0 || STORAGE_MODE == 3
     // Stream bytes from a cached 32-bit word to avoid reloading on every bitplane byte.
     uint word = payload_data_u32.data[byte_offset >> 2] >> ((byte_offset & 3u) << 3);
+#define NEXT_BYTE() do { byte_offset++; if ((byte_offset & 3u) == 0u) word = payload_data_u32.data[byte_offset >> 2]; else word >>= 8; } while (false)
+#define CUR_BYTE() (word & 0xffu)
+#else
+    uint payload_cur = read_payload_u8(byte_offset);
+#define NEXT_BYTE() do { byte_offset++; payload_cur = read_payload_u8(byte_offset); } while (false)
+#define CUR_BYTE() payload_cur
+#endif
 
-    for (int q = plane_iterations - 1; q >= 0; q--)
+    if (plane_iterations <= 8)
     {
-        uint payload = word & 0xffu;
-        significant_mask |= payload;
-        for (int b = 0; b < 8; b++)
+        uint lo4 = 0u;
+        uint hi4 = 0u;
+        for (int q = plane_iterations - 1; q >= 0; q--)
         {
-            int decoded = int(bitfieldExtract(payload, b, 1));
-            decoded_abs[b] = bitfieldInsert(decoded_abs[b], decoded, q, 1);
+            uint payload = CUR_BYTE();
+            significant_mask |= payload;
+            lo4 = (lo4 << 1) | (((payload & 0xfu) * 0x00204081u) & 0x01010101u);
+            hi4 = (hi4 << 1) | (((payload >> 4) * 0x00204081u) & 0x01010101u);
+            if (q > 0)
+                NEXT_BYTE();
         }
-
-        if (q > 0)
+        mat2x4 m;
+        for (int i = 0; i < 4; i++)
         {
-            byte_offset++;
-            if ((byte_offset & 3u) == 0u)
-                word = payload_data_u32.data[byte_offset >> 2];
+            uint packed = (i < 2) ? lo4 : hi4;
+            int sh = (i & 1) * 16;
+            uint d0 = bitfieldExtract(packed, sh, 8);
+            uint d1 = bitfieldExtract(packed, sh + 8, 8);
+            m[0][i] = d0 != 0u ? float(d0) + 0.5 : 0.0;
+            m[1][i] = d1 != 0u ? float(d1) + 0.5 : 0.0;
+        }
+        return m;
+    }
+
+    if (plane_iterations <= 16)
+    {
+        uint lo4 = 0u, hi4 = 0u, lo4_hi = 0u, hi4_hi = 0u;
+        for (int q = plane_iterations - 1; q >= 0; q--)
+        {
+            uint payload = CUR_BYTE();
+            significant_mask |= payload;
+            uint p_lo = ((payload & 0xfu) * 0x00204081u) & 0x01010101u;
+            uint p_hi = ((payload >> 4) * 0x00204081u) & 0x01010101u;
+            if (q < 8)
+            {
+                lo4 = (lo4 << 1) | p_lo;
+                hi4 = (hi4 << 1) | p_hi;
+            }
             else
-                word >>= 8;
+            {
+                lo4_hi = (lo4_hi << 1) | p_lo;
+                hi4_hi = (hi4_hi << 1) | p_hi;
+            }
+            if (q > 0)
+                NEXT_BYTE();
         }
+        mat2x4 m;
+        for (int i = 0; i < 4; i++)
+        {
+            uint packed_lo = (i < 2) ? lo4 : hi4;
+            uint packed_hi = (i < 2) ? lo4_hi : hi4_hi;
+            int sh = (i & 1) * 16;
+            uint d0 = bitfieldExtract(packed_lo, sh, 8) | (bitfieldExtract(packed_hi, sh, 8) << 8);
+            uint d1 = bitfieldExtract(packed_lo, sh + 8, 8) | (bitfieldExtract(packed_hi, sh + 8, 8) << 8);
+            m[0][i] = d0 != 0u ? float(d0) + 0.5 : 0.0;
+            m[1][i] = d1 != 0u ? float(d1) + 0.5 : 0.0;
+        }
+        return m;
     }
-#else
-#if STORAGE_MODE == 0
-    // Eagerly load the data to keep latency down.
-    // Also forces the descriptor to be loaded early.
-    uint payload = uint(payload_data_u8.data[byte_offset]);
-#else
-    uint payload = read_payload_u8(byte_offset);
-#endif
 
+    int decoded_abs[8] = int[8](0, 0, 0, 0, 0, 0, 0, 0);
     for (int q = plane_iterations - 1; q >= 0; q--)
     {
+        uint payload = CUR_BYTE();
         significant_mask |= payload;
         for (int b = 0; b < 8; b++)
         {
             int decoded = int(bitfieldExtract(payload, b, 1));
             decoded_abs[b] = bitfieldInsert(decoded_abs[b], decoded, q, 1);
         }
-
         if (q > 0)
-        {
-            byte_offset++;
-#if STORAGE_MODE == 0
-            payload = uint(payload_data_u8.data[byte_offset]);
-#else
-            payload = read_payload_u8(byte_offset);
-#endif
-        }
+            NEXT_BYTE();
     }
-#endif
 
     mat2x4 m;
-
     for (int i = 0; i < 4; i++)
     {
         for (int j = 0; j < 2; j++)
@@ -218,8 +249,9 @@ mat2x4 decode_payload(uint code_word, uint q_bits, uint offset, uint block_index
             m[j][i] = v;
         }
     }
-
     return m;
+#undef NEXT_BYTE
+#undef CUR_BYTE
 }
 
 shared uint shared_sign_offset;
@@ -319,10 +351,8 @@ void main()
 
 #if STORAGE_MODE == 0 || STORAGE_MODE == 3
     uint ballot = payload_data_u32.data[offset_u32] & 0xffffu;
-    uint q_code = payload_data_u32.data[offset_u32 + 1] & 0xffu;
 #else
     uint ballot = read_payload_u16(2 * offset_u32);
-    uint q_code = read_payload_u8(4 * offset_u32 + 4);
 #endif
 
     if (local_index < 16)
@@ -385,6 +415,11 @@ void main()
 
     if (bitfieldExtract(ballot, int(linear_block), 1) != 0)
     {
+#if STORAGE_MODE == 0 || STORAGE_MODE == 3
+        uint q_code = payload_data_u32.data[offset_u32 + 1] & 0xffu;
+#else
+        uint q_code = read_payload_u8(4 * offset_u32 + 4);
+#endif
         uint control_word = shared_control_word[linear_block];
         uint control_word2 = shared_control_word2[linear_block];
 
