@@ -187,12 +187,17 @@ void load_tile_mixed(ivec2 base_coord, ivec2 lc, uint mask1, uint mask2, uint ma
     write_shared_4x4(lc, t0, t1, t2, t3);
 }
 
+ivec2 load_apron_coord()
+{
+    if (local_index < 20u)
+        return ivec2(BLOCK_SIZE_HALF + 2 * int(local_index & 1u), 2 * int(local_index >> 1));
+    uint vi = local_index - 32u;
+    return ivec2(2 * int(vi >> 1), BLOCK_SIZE_HALF + 2 * int(vi & 1u));
+}
+
 void load_image_with_apron(ivec2 wg)
 {
     ivec2 base_coord = wg * ivec2(BLOCK_SIZE_HALF) - APRON_HALF;
-    ivec2 local_coord0 = 2 * unswizzle8x8(local_index);
-    ivec2 local_coord_horiz = ivec2(BLOCK_SIZE_HALF + 2 * (local_index % 2u), 2 * (local_index / 2u));
-    ivec2 local_coord_vert = local_coord_horiz.yx;
 
     int bx0 = 0, by0 = 0;
     uint mask1 = 0xfu, mask2 = 0xfu, mask3 = 0xfu;
@@ -237,39 +242,55 @@ void load_image_with_apron(ivec2 wg)
 
     if (wg_interior)
     {
+        ivec2 local_coord0 = 2 * unswizzle8x8(local_index);
+        bool has_apron = (local_index < 20u) || ((local_index - 32u) < 16u);
         if (ActiveBandMask == 0u || (MaskCheck && (mask1 | mask2 | mask3) == 0u))
         {
-            load_tile_ll(base_coord, local_coord0);
-            if (local_coord_horiz.y < BLOCK_SIZE_HALF + 2 * APRON_HALF)
-                load_tile_ll(base_coord, local_coord_horiz);
-            if (local_coord_vert.x < BLOCK_SIZE_HALF)
-                load_tile_ll(base_coord, local_coord_vert);
+            ivec2 c0 = base_coord + local_coord0;
+            VEC4 t0 = VEC4(texelFetch(uTexture, ivec3(c0.y >> 1, c0.x >> 1, 0), 0).xzyw);
+            ivec2 ac = ivec2(0);
+            VEC4 ta = VEC4(0.0);
+            if (has_apron)
+            {
+                ac = load_apron_coord();
+                ivec2 ca = base_coord + ac;
+                ta = VEC4(texelFetch(uTexture, ivec3(ca.y >> 1, ca.x >> 1, 0), 0).xzyw);
+            }
+            if (ActiveBandMask == 0u)
+            {
+                write_shared_4x4_ll(local_coord0, t0);
+                if (has_apron)
+                    write_shared_4x4_ll(ac, ta);
+            }
+            else
+            {
+                write_shared_4x4(local_coord0, t0, VEC4(0.0), VEC4(0.0), VEC4(0.0));
+                if (has_apron)
+                    write_shared_4x4(ac, ta, VEC4(0.0), VEC4(0.0), VEC4(0.0));
+            }
         }
         else if (ActiveBandMask == 7u && (!MaskCheck || (mask1 & mask2 & mask3) == 0xfu))
         {
             load_tile_all(base_coord, local_coord0);
-            if (local_coord_horiz.y < BLOCK_SIZE_HALF + 2 * APRON_HALF)
-                load_tile_all(base_coord, local_coord_horiz);
-            if (local_coord_vert.x < BLOCK_SIZE_HALF)
-                load_tile_all(base_coord, local_coord_vert);
+            if (has_apron)
+                load_tile_all(base_coord, load_apron_coord());
         }
         else
         {
             load_tile_mixed(base_coord, local_coord0, mask1, mask2, mask3, bx0, by0);
-            if (local_coord_horiz.y < BLOCK_SIZE_HALF + 2 * APRON_HALF)
-                load_tile_mixed(base_coord, local_coord_horiz, mask1, mask2, mask3, bx0, by0);
-            if (local_coord_vert.x < BLOCK_SIZE_HALF)
-                load_tile_mixed(base_coord, local_coord_vert, mask1, mask2, mask3, bx0, by0);
+            if (has_apron)
+                load_tile_mixed(base_coord, load_apron_coord(), mask1, mask2, mask3, bx0, by0);
         }
     }
     else
     {
+        ivec2 local_coord0 = 2 * unswizzle8x8(local_index);
+        bool has_apron = (local_index < 20u) || ((local_index - 32u) < 16u);
         [[dont_unroll]]
-        for (int pass = 0; pass < 3; pass++)
+        for (int pass = 0; pass < 2; pass++)
         {
-            ivec2 lc = (pass == 0) ? local_coord0 : ((pass == 1) ? local_coord_horiz : local_coord_vert);
-            if (pass == 1 && lc.y >= BLOCK_SIZE_HALF + 2 * APRON_HALF) continue;
-            if (pass == 2 && lc.x >= BLOCK_SIZE_HALF) continue;
+            if (pass == 1 && !has_apron) continue;
+            ivec2 lc = (pass == 0) ? local_coord0 : load_apron_coord();
 
             ivec2 c = base_coord + lc;
             if (ActiveBandMask == 0u)
