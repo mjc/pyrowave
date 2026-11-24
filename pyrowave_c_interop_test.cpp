@@ -640,20 +640,35 @@ static void test_direct_interop()
 	CHECKED(pyrowave_encoder_packetize(encoder, &packet, rate_control.maximum_bitstream_size, &num_packets,
 		bitstream.get(), rate_control.maximum_bitstream_size));
 
-	CHECKED(pyrowave_decoder_push_packet(decoder, bitstream.get() + packet.offset, packet.size));
-	ASSERT_THAT(pyrowave_decoder_decode_is_ready(decoder, false));
-
 	for (auto &plane : gpu_buffers.planes)
 	{
 		plane.image = output_image->get_image();
 		plane.layout = VK_IMAGE_LAYOUT_GENERAL;
 	}
+	pyrowave_decode_target target = nullptr;
+	CHECKED(pyrowave_decode_target_create(decoder, &gpu_buffers, &target));
+	ASSERT_THAT(pyrowave_decoder_decode_target(decoder, target) == PYROWAVE_ERROR_INVALID_ARGUMENT);
 
-	cmd = device.request_command_buffer();
-	// Redirect commands here.
-	pyrowave_device_set_command_buffer(pyro_device, cmd->get_command_buffer());
-	CHECKED(pyrowave_decoder_decode_gpu_buffer(decoder, nullptr, nullptr, &gpu_buffers));
-	pyrowave_device_set_command_buffer(pyro_device, VK_NULL_HANDLE);
+	for (int frame = 0; frame < 2; frame++)
+	{
+		pyrowave_decoder_clear(decoder);
+		CHECKED(pyrowave_decoder_push_packet(decoder, bitstream.get() + packet.offset, packet.size));
+		ASSERT_THAT(pyrowave_decoder_decode_is_ready(decoder, false));
+
+		cmd = device.request_command_buffer();
+		if (frame != 0)
+			cmd->barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+			             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+		pyrowave_device_set_command_buffer(pyro_device, cmd->get_command_buffer());
+		CHECKED(pyrowave_decoder_decode_target(decoder, target));
+		pyrowave_device_set_command_buffer(pyro_device, VK_NULL_HANDLE);
+		if (frame == 0)
+		{
+			fence.reset();
+			device.submit(cmd, &fence);
+			fence->wait();
+		}
+	}
 
 	cmd->image_barrier(*output_image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 	                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
@@ -688,6 +703,7 @@ static void test_direct_interop()
 		}
 	}
 
+	pyrowave_decode_target_destroy(target);
 	pyrowave_encoder_destroy(encoder);
 	pyrowave_decoder_destroy(decoder);
 	pyrowave_device_destroy(pyro_device);

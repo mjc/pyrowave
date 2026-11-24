@@ -20,6 +20,8 @@
 			"path": "idwt.comp",
 			"variants": [
 				{ "define": "PRECISION", "count": 3, "resolve": false },
+				{ "define": "PACKED_INPUT", "count": 2, "resolve": false },
+				{ "define": "PACKED_OUTPUT", "count": 2, "resolve": false },
 				{ "define": "FP16", "count": 2, "resolve": true }
 			]
 		},
@@ -64,7 +66,8 @@
 			"compute": true,
 			"path": "wavelet_dequant.comp",
 			"variants": [
-				{ "define": "STORAGE_MODE", "count" : 3 }
+				{ "define": "STORAGE_MODE", "count" : 4 },
+				{ "define": "PACKED_2X2", "count" : 2 }
 			]
 		}
 	]

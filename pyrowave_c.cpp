@@ -12,6 +12,7 @@
 #include "slangmosh_scaler.hpp"
 #include "scaler.hpp"
 #include "thread_id.hpp"
+#include <new>
 
 using namespace Granite;
 using namespace Vulkan;
@@ -45,6 +46,9 @@ struct pyrowave_device_opaque
 	Device device;
 	VkCommandBuffer cmd = VK_NULL_HANDLE;
 	CommandBuffer::Type queue_type = CommandBuffer::Type::Generic;
+#ifdef __ANDROID__
+	uint64_t pipeline_cache_generation = 0;
+#endif
 };
 
 void pyrowave_device_set_command_buffer(pyrowave_device device, VkCommandBuffer cmd)
@@ -172,6 +176,12 @@ pyrowave_result pyrowave_create_default_device(pyrowave_device *device)
 
 static std::mutex global_device_lock;
 
+#ifdef __ANDROID__
+// Granite's filesystem cache is disabled in the Android library. Keep the
+// last stream's cache in memory so a reconnect can reuse its compiled pipelines.
+static std::vector<uint8_t> android_pipeline_cache;
+static uint64_t android_pipeline_cache_generation;
+#endif
 pyrowave_result pyrowave_create_device(const pyrowave_device_create_info *info, pyrowave_device *out_device)
 {
 	// TODO: Find a better way to do this.
@@ -249,6 +259,12 @@ pyrowave_result pyrowave_create_device(const pyrowave_device_create_info *info, 
 	context_opts.memory_priorities = false;
 	context_opts.lean_memory_mode = true;
 	dev->device.set_context(dev->context, context_opts);
+
+#ifdef __ANDROID__
+	if (!dev->device.get_device_features().pipeline_binary_features.pipelineBinaries &&
+	    dev->device.init_pipeline_cache(android_pipeline_cache.data(), android_pipeline_cache.size()))
+		dev->pipeline_cache_generation = ++android_pipeline_cache_generation;
+#endif
 
 	dev->device.set_queue_lock(
 		[cb = info->queue_lock_callback, userdata = info->userdata]() {
@@ -444,6 +460,22 @@ void pyrowave_device_destroy(pyrowave_device device)
 {
 	Util::set_thread_logging_interface(&null_logger);
 
+#ifdef __ANDROID__
+	if (device && device->pipeline_cache_generation != 0)
+	{
+		std::lock_guard<std::mutex> holder{global_device_lock};
+		if (device->pipeline_cache_generation == android_pipeline_cache_generation)
+		{
+			const size_t size = device->device.get_pipeline_cache_size();
+			if (size > 0 && size <= 16 * 1024 * 1024)
+			{
+				std::vector<uint8_t> cache(size);
+				if (device->device.get_pipeline_cache_data(cache.data(), cache.size()))
+					android_pipeline_cache.swap(cache);
+			}
+		}
+	}
+#endif
 	delete device;
 }
 
@@ -1787,11 +1819,48 @@ bool pyrowave_decoder_decode_is_ready_with_sideband(pyrowave_decoder decoder, bo
 	                                        active_block_mask, word_count);
 }
 
+struct pyrowave_decode_target_opaque
+{
+	pyrowave_decoder decoder;
+	WrappedViewBuffers views;
+};
+
+static VkImageUsageFlags decode_target_usage(pyrowave_decoder decoder)
+{
+	return decoder->fragment_path ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : VK_IMAGE_USAGE_STORAGE_BIT;
+}
+
 pyrowave_result
-pyrowave_decoder_decode_gpu_buffer(pyrowave_decoder decoder,
-                                   const pyrowave_gpu_sync_operation *acquire,
-                                   const pyrowave_gpu_sync_operation *release,
-                                   const pyrowave_gpu_buffers *buffers)
+pyrowave_decode_target_create(pyrowave_decoder decoder, const pyrowave_gpu_buffers *buffers,
+                              pyrowave_decode_target *target)
+{
+	if (!decoder || !buffers || !target)
+		return PYROWAVE_ERROR_INVALID_ARGUMENT;
+
+	*target = nullptr;
+	auto *prepared = new (std::nothrow) pyrowave_decode_target_opaque{};
+	if (!prepared)
+		return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
+	prepared->decoder = decoder;
+	if (!prepared->views.wrap(decoder->device, buffers, decode_target_usage(decoder)))
+	{
+		delete prepared;
+		return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
+	}
+	*target = prepared;
+	return PYROWAVE_SUCCESS;
+}
+
+void pyrowave_decode_target_destroy(pyrowave_decode_target target)
+{
+	delete target;
+}
+
+static pyrowave_result decode_gpu_views(pyrowave_decoder decoder,
+                                       const pyrowave_gpu_sync_operation *acquire,
+                                       const pyrowave_gpu_sync_operation *release,
+                                       const pyrowave_gpu_buffers *buffers,
+                                       WrappedViewBuffers &views)
 {
 	if (decoder->pyro_device->cmd && (acquire || release))
 		return PYROWAVE_ERROR_INVALID_ARGUMENT;
@@ -1800,13 +1869,11 @@ pyrowave_decoder_decode_gpu_buffer(pyrowave_decoder decoder,
 		return PYROWAVE_ERROR_NOT_IMPLEMENTED;
 
 	Util::register_thread_index(0);
-
 	Util::set_thread_logging_interface(&null_logger);
 	auto *device = decoder->device;
 	device->next_frame_context();
 
-	WrappedViewBuffers views = {};
-	if (!views.wrap(device, buffers, decoder->fragment_path ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : VK_IMAGE_USAGE_STORAGE_BIT))
+	if (buffers && !views.wrap(device, buffers, decode_target_usage(decoder)))
 		return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
 	views.range_scale = decoder->ycbcr_scaling_factor;
 
@@ -1876,6 +1943,26 @@ pyrowave_decoder_decode_gpu_buffer(pyrowave_decoder decoder,
 	pyrowave_device_signal_semaphore(device, decoder->pyro_device->queue_type, release);
 
 	return PYROWAVE_SUCCESS;
+}
+
+pyrowave_result
+pyrowave_decoder_decode_gpu_buffer(pyrowave_decoder decoder,
+                                   const pyrowave_gpu_sync_operation *acquire,
+                                   const pyrowave_gpu_sync_operation *release,
+                                   const pyrowave_gpu_buffers *buffers)
+{
+	if (!buffers)
+		return PYROWAVE_ERROR_INVALID_ARGUMENT;
+	WrappedViewBuffers views = {};
+	return decode_gpu_views(decoder, acquire, release, buffers, views);
+}
+
+pyrowave_result
+pyrowave_decoder_decode_target(pyrowave_decoder decoder, pyrowave_decode_target target)
+{
+	if (!decoder || !target || target->decoder != decoder || !decoder->pyro_device->cmd)
+		return PYROWAVE_ERROR_INVALID_ARGUMENT;
+	return decode_gpu_views(decoder, nullptr, nullptr, nullptr, target->views);
 }
 
 pyrowave_result

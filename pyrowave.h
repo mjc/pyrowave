@@ -66,6 +66,7 @@ typedef struct pyrowave_decoder_opaque *pyrowave_decoder;
 typedef struct pyrowave_device_opaque *pyrowave_device;
 typedef struct pyrowave_sync_object_opaque *pyrowave_sync_object;
 typedef struct pyrowave_image_opaque *pyrowave_image;
+typedef struct pyrowave_decode_target_opaque *pyrowave_decode_target;
 
 // Used to dynamically detect any API/ABI incompatibility.
 // This entry point is stable.
@@ -655,6 +656,16 @@ pyrowave_decoder_decode_gpu_buffer(pyrowave_decoder decoder,
                                    const pyrowave_gpu_sync_operation *acquire,
                                    const pyrowave_gpu_sync_operation *release,
                                    const pyrowave_gpu_buffers *buffers);
+
+// Reuse the views for an output plane set. The images must remain alive until
+// the target has been destroyed and the device has retired its deferred views.
+// Use the target with the decoder that created it and release it before the device.
+PYROWAVE_PUBLIC_API pyrowave_result
+pyrowave_decode_target_create(pyrowave_decoder decoder, const pyrowave_gpu_buffers *buffers,
+                              pyrowave_decode_target *target);
+PYROWAVE_PUBLIC_API void pyrowave_decode_target_destroy(pyrowave_decode_target target);
+PYROWAVE_PUBLIC_API pyrowave_result
+pyrowave_decoder_decode_target(pyrowave_decoder decoder, pyrowave_decode_target target);
 
 // A command buffer must not be set on pyrowave_device.
 PYROWAVE_PUBLIC_API pyrowave_result

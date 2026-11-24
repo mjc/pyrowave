@@ -19,12 +19,75 @@ struct DequantizerPushData
 	int32_t output_layer;
 	int32_t block_offset_32x32;
 	int32_t block_stride_32x32;
+	int32_t band_stride_32x32;
 };
+
+static bool select_uma_buffer_domain(const Device &dev, BufferDomain &out_domain)
+{
+	const auto &mem_props = dev.get_memory_properties();
+	constexpr VkMemoryPropertyFlags cached_flags =
+		VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+		VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+	constexpr VkMemoryPropertyFlags coherent_flags =
+		VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+		VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	constexpr VkDeviceSize min_uma_heap_size = 512ull * 1024ull * 1024ull;
+
+	bool has_cached = false;
+	bool has_coherent = false;
+
+	for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++)
+	{
+		const auto &type = mem_props.memoryTypes[i];
+		if (type.heapIndex >= mem_props.memoryHeapCount ||
+		    mem_props.memoryHeaps[type.heapIndex].size < min_uma_heap_size)
+			continue;
+
+		if ((type.propertyFlags & cached_flags) == cached_flags)
+			has_cached = true;
+		if ((type.propertyFlags & coherent_flags) == coherent_flags)
+			has_coherent = true;
+	}
+
+	if (has_cached)
+	{
+		// Prefer CPU-cached UMA memory (coherent when available, otherwise flushed via unmap_host_buffer).
+		out_domain = BufferDomain::UMACachedCoherentPreferDevice;
+		return true;
+	}
+	if (has_coherent)
+	{
+		out_domain = BufferDomain::LinkedDeviceHost;
+		return true;
+	}
+	return false;
+}
 
 struct Decoder::Impl final : public WaveletBuffers
 {
-	BufferHandle dequant_offset_buffer, payload_data;
+	static constexpr uint32_t kUmaRingSlots = 4;
+
+	BufferHandle dequant_offset_buffer, payload_data, edge_wg_list_buffer, active_blocks_buffer;
 	BufferViewHandle payload_u32_view, payload_u16_view, payload_u8_view;
+
+	// Ring-buffered zero-copy UMA upload buffers (used when !use_readonly_texel_buffer and UMA heap is present).
+	bool use_uma_upload = false;
+	bool uma_offset_direct = false;
+	bool uma_offset_synced_to_cpu = false;
+	BufferDomain uma_domain = BufferDomain::LinkedDeviceHost;
+	uint32_t uma_slot = 0;
+	BufferHandle uma_dequant_offset[kUmaRingSlots];
+	BufferHandle uma_payload_data[kUmaRingSlots];
+	BufferHandle uma_active_blocks[kUmaRingSlots];
+	uint32_t *uma_payload_write_ptr = nullptr;
+	uint32_t *uma_offset_write_ptr = nullptr;
+	size_t uma_payload_written_words = 0;
+	size_t uma_payload_cap_words = 0;
+	bool uma_slot_submitted = false;
+	uint32_t uma_submitted_slot = 0;
+	VkDeviceSize uma_submitted_bytes = 0;
 
 	// Turbo-hacky path.
 	DeviceAllocationOwnerHandle linear_memory;
@@ -33,6 +96,33 @@ struct Decoder::Impl final : public WaveletBuffers
 
 	std::vector<uint32_t> dequant_offset_buffer_cpu;
 	std::vector<uint32_t> payload_data_cpu;
+	// Per-block lookup packed as (level << 4) | (component << 2) | band for O(1) active tracking.
+	std::vector<uint8_t> block_to_comp_level_band;
+	// Per-block packed (bx | (by << 12) | (band << 24)) for packed 1D active-block dequant dispatch.
+	std::vector<uint32_t> block_dequant_coord;
+	struct ActiveBlockEntry
+	{
+		uint32_t coord;
+		uint32_t offset;
+	};
+	std::vector<ActiveBlockEntry> active_block_list[NumComponents][DecompositionLevels];
+	uint32_t active_block_offset[NumComponents][DecompositionLevels] = {};
+	uint32_t active_hf_blocks[NumComponents][DecompositionLevels] = {};
+	struct IdwtLevelLayout
+	{
+		int32_t ix_end = 0;
+		int32_t iy_end = 0;
+		uint32_t edge_offset = 0;
+		uint32_t edge_count = 0;
+		bool use_split = false;
+	};
+	IdwtLevelLayout idwt_level_layouts[DecompositionLevels] = {};
+	std::vector<uint32_t> edge_wg_list_cpu;
+	bool edge_wg_list_uploaded = false;
+	bool subgroup_ballot_mask = false;
+	bool prewarmed_idwt_intermediate = false;
+	bool prewarmed_idwt_final = false;
+	float prewarmed_range_scale = 0.0f;
 	int decoded_blocks = 0;
 	int total_blocks_in_sequence = 0;
 	uint32_t last_seq = UINT32_MAX;
@@ -45,7 +135,6 @@ struct Decoder::Impl final : public WaveletBuffers
 	                     const uint32_t *active_block_mask, size_t word_count) const;
 	bool has_pristine_bands(int bands, const uint32_t *active_block_mask, size_t word_count) const;
 
-	bool decode_packet(const BitstreamHeader *header);
 
 	bool dequant(CommandBuffer &cmd);
 	bool idwt(CommandBuffer &cmd, const ViewBuffers &views);
@@ -54,6 +143,10 @@ struct Decoder::Impl final : public WaveletBuffers
 	void clear();
 
 	void upload_payload(CommandBuffer &cmd);
+	bool upload_payload_uma(CommandBuffer &cmd);
+	void begin_uma_payload_write();
+	void discard_uma_payload_write();
+	void build_static_edge_wg_lists();
 
 	void check_linear_texture_support();
 };
@@ -65,6 +158,8 @@ Decoder::Decoder()
 
 Decoder::~Decoder()
 {
+	if (impl)
+		impl->discard_uma_payload_write();
 }
 
 void Decoder::Impl::upload_payload(CommandBuffer &cmd)
@@ -126,37 +221,323 @@ void Decoder::Impl::upload_payload(CommandBuffer &cmd)
 		memcpy(cmd.update_buffer(*payload_data, 0, required_size), payload_data_cpu.data(), required_size);
 }
 
-bool Decoder::Impl::decode_packet(const BitstreamHeader *header)
+void Decoder::Impl::discard_uma_payload_write()
 {
-	auto &offset = dequant_offset_buffer_cpu[header->block_index];
-	if (offset == UINT32_MAX)
+	if (uma_payload_write_ptr && uma_payload_data[uma_slot])
 	{
-		decoded_blocks++;
-		offset = payload_data_cpu.size();
+		device->unmap_host_buffer(*uma_payload_data[uma_slot], MEMORY_ACCESS_WRITE_BIT);
+		uma_payload_write_ptr = nullptr;
+	}
+	if (uma_offset_write_ptr && uma_dequant_offset[uma_slot])
+	{
+		device->unmap_host_buffer(*uma_dequant_offset[uma_slot], MEMORY_ACCESS_WRITE_BIT);
+		uma_offset_write_ptr = nullptr;
+	}
+	uma_payload_written_words = 0;
+	uma_payload_cap_words = 0;
+}
+
+void Decoder::Impl::begin_uma_payload_write()
+{
+	if (uma_slot_submitted)
+	{
+		uma_slot = (uma_slot + 1) % kUmaRingSlots;
+		uma_slot_submitted = false;
+		uma_submitted_bytes = 0;
+	}
+
+	uma_payload_written_words = 0;
+	uma_payload_cap_words = 0;
+	if (!use_uma_upload)
+		return;
+
+	if (uma_offset_direct && !uma_offset_write_ptr && uma_dequant_offset[uma_slot])
+	{
+		uma_offset_write_ptr = static_cast<uint32_t *>(device->map_host_buffer(
+			*uma_dequant_offset[uma_slot], MEMORY_ACCESS_READ_BIT | MEMORY_ACCESS_WRITE_BIT));
+	}
+
+	if (uma_payload_write_ptr && uma_payload_data[uma_slot])
+	{
+		uma_payload_cap_words = size_t(uma_payload_data[uma_slot]->get_create_info().size / sizeof(uint32_t));
+		return;
+	}
+
+	auto &payload_buf = uma_payload_data[uma_slot];
+	if (!payload_buf)
+	{
+		BufferCreateInfo bufinfo;
+		// Pre-size ring slots to hold typical frames without mid-frame reallocations.
+		VkDeviceSize initial_bytes = std::max<VkDeviceSize>(256 * 1024, VkDeviceSize(aligned_width) * VkDeviceSize(aligned_height) / 2);
+		bufinfo.size = initial_bytes;
+		bufinfo.usage =
+			VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+			VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
+			VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+			VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		bufinfo.domain = uma_domain;
+		payload_buf = device->create_buffer(bufinfo);
+		if (!payload_buf)
+			return;
+		device->set_name(*payload_buf, "payload-data-uma");
+	}
+
+	uma_payload_write_ptr = static_cast<uint32_t *>(device->map_host_buffer(*payload_buf, MEMORY_ACCESS_WRITE_BIT));
+	if (uma_payload_write_ptr)
+		uma_payload_cap_words = size_t(payload_buf->get_create_info().size / sizeof(uint32_t));
+}
+
+bool Decoder::Impl::upload_payload_uma(CommandBuffer &cmd)
+{
+	VkDeviceSize tail_size = payload_data_cpu.size() * sizeof(uint32_t);
+
+	if (uma_slot_submitted)
+	{
+		// Incremental decode of additional packets on an already-submitted sequence.
+		uint32_t prev_slot = uma_submitted_slot;
+		VkDeviceSize prev_bytes = uma_submitted_bytes;
+		VkDeviceSize total_size = prev_bytes + tail_size;
+		VkDeviceSize total_padded = total_size + 16;
+
+		if (tail_size == 0 && uma_payload_data[prev_slot])
+		{
+			uma_slot = prev_slot;
+			return true;
+		}
+		else
+		{
+			uma_slot = (uma_slot + 1) % kUmaRingSlots;
+			auto &dst_buf = uma_payload_data[uma_slot];
+			if (!dst_buf || total_padded > dst_buf->get_create_info().size)
+			{
+				BufferCreateInfo bufinfo;
+				bufinfo.size = std::max<VkDeviceSize>(64 * 1024, total_padded * 2);
+				bufinfo.usage =
+					VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+					VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
+					VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+					VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+				bufinfo.domain = uma_domain;
+				dst_buf = device->create_buffer(bufinfo);
+				if (!dst_buf)
+					return false;
+				device->set_name(*dst_buf, "payload-data-uma");
+			}
+			if (prev_bytes > 0 && uma_payload_data[prev_slot])
+				cmd.copy_buffer(*dst_buf, 0, *uma_payload_data[prev_slot], 0, prev_bytes);
+			if (tail_size > 0)
+				memcpy(cmd.update_buffer(*dst_buf, prev_bytes, tail_size), payload_data_cpu.data(), tail_size);
+			memset(cmd.update_buffer(*dst_buf, total_size, 16), 0, 16);
+			cmd.barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+			            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+
+			uma_submitted_slot = uma_slot;
+			uma_submitted_bytes = total_size;
+			uma_payload_written_words = size_t(total_size / sizeof(uint32_t));
+			payload_data_cpu.clear();
+		}
 	}
 	else
 	{
-		return true;
+		VkDeviceSize direct_size = uma_payload_written_words * sizeof(uint32_t);
+		VkDeviceSize required_size = direct_size + tail_size;
+		VkDeviceSize required_size_padded = required_size + 16;
+
+		auto &payload_buf = uma_payload_data[uma_slot];
+		if (!payload_buf || required_size_padded > payload_buf->get_create_info().size)
+		{
+			BufferCreateInfo bufinfo;
+			bufinfo.size = std::max<VkDeviceSize>(64 * 1024, required_size_padded * 2);
+			bufinfo.usage =
+				VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+				VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
+				VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+				VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+			bufinfo.domain = uma_domain;
+			BufferHandle new_buf = device->create_buffer(bufinfo);
+			if (!new_buf)
+				return false;
+			device->set_name(*new_buf, "payload-data-uma");
+
+			if (uma_payload_write_ptr && payload_buf)
+			{
+				if (direct_size > 0)
+					device->unmap_host_buffer(*payload_buf, MEMORY_ACCESS_WRITE_BIT, 0, direct_size);
+				uma_payload_write_ptr = nullptr;
+			}
+
+			if (direct_size > 0 && payload_buf)
+				cmd.copy_buffer(*new_buf, 0, *payload_buf, 0, direct_size);
+			if (tail_size > 0)
+				memcpy(cmd.update_buffer(*new_buf, direct_size, tail_size), payload_data_cpu.data(), tail_size);
+			memset(cmd.update_buffer(*new_buf, required_size, 16), 0, 16);
+			cmd.barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+			            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+
+			payload_buf = std::move(new_buf);
+		}
+		else if (uma_payload_write_ptr)
+		{
+			if (tail_size > 0)
+				memcpy(reinterpret_cast<uint8_t *>(uma_payload_write_ptr) + direct_size, payload_data_cpu.data(), tail_size);
+			memset(reinterpret_cast<uint8_t *>(uma_payload_write_ptr) + required_size, 0, 16);
+			device->unmap_host_buffer(*payload_buf, MEMORY_ACCESS_WRITE_BIT, 0, required_size_padded);
+			uma_payload_write_ptr = nullptr;
+		}
+		else
+		{
+			auto *payload_dst = static_cast<uint8_t *>(device->map_host_buffer(*payload_buf, MEMORY_ACCESS_WRITE_BIT));
+			if (!payload_dst)
+				return false;
+			if (tail_size > 0)
+				memcpy(payload_dst, payload_data_cpu.data(), tail_size);
+			memset(payload_dst + tail_size, 0, 16);
+			device->unmap_host_buffer(*payload_buf, MEMORY_ACCESS_WRITE_BIT, 0, required_size_padded);
+		}
+
+		uma_slot_submitted = true;
+		uma_submitted_slot = uma_slot;
+		uma_submitted_bytes = required_size;
+		uma_payload_written_words = size_t(required_size / sizeof(uint32_t));
+		uma_payload_cap_words = 0;
+		payload_data_cpu.clear();
 	}
 
-	auto *payload_words = reinterpret_cast<const uint32_t *>(header);
-
-	if (sizeof(*header) / sizeof(uint32_t) > header->payload_words)
-	{
-		LOGE("payload_words is not large enough.\n");
+	auto &offset_buf = uma_dequant_offset[uma_slot];
+	if (!offset_buf)
 		return false;
+
+	VkDeviceSize offset_size = VkDeviceSize(block_count_32x32) * sizeof(uint32_t);
+	if (offset_size > 0)
+	{
+		if (uma_offset_write_ptr)
+		{
+			device->unmap_host_buffer(*offset_buf, MEMORY_ACCESS_WRITE_BIT, 0, offset_size);
+			uma_offset_write_ptr = nullptr;
+		}
+		else
+		{
+			auto *offset_dst = static_cast<uint8_t *>(device->map_host_buffer(*offset_buf, MEMORY_ACCESS_WRITE_BIT));
+			if (!offset_dst)
+				return false;
+			memcpy(offset_dst, dequant_offset_buffer_cpu.data(), offset_size);
+			device->unmap_host_buffer(*offset_buf, MEMORY_ACCESS_WRITE_BIT, 0, offset_size);
+		}
 	}
 
-	payload_data_cpu.insert(
-			payload_data_cpu.end(),
-			payload_words,
-			payload_words + header->payload_words);
+	if (packed_2x2_wavelets && uma_active_blocks[uma_slot])
+	{
+		uint32_t total_entries = 0;
+		for (int l = 0; l < DecompositionLevels - 1; l++)
+			for (int c = 0; c < NumComponents; c++)
+				total_entries += active_hf_blocks[c][l];
+
+		if (total_entries > 0)
+		{
+			auto *dst = static_cast<ActiveBlockEntry *>(device->map_host_buffer(*uma_active_blocks[uma_slot], MEMORY_ACCESS_WRITE_BIT));
+			if (!dst)
+				return false;
+			uint32_t entry_offset = 0;
+			for (int l = 0; l < DecompositionLevels - 1; l++)
+			{
+				for (int c = 0; c < NumComponents; c++)
+				{
+					active_block_offset[c][l] = entry_offset;
+					const uint32_t count = active_hf_blocks[c][l];
+					if (count > 0)
+					{
+						memcpy(dst + entry_offset, active_block_list[c][l].data(), count * sizeof(ActiveBlockEntry));
+						entry_offset += count;
+					}
+				}
+			}
+			device->unmap_host_buffer(*uma_active_blocks[uma_slot], MEMORY_ACCESS_WRITE_BIT,
+			                          0, VkDeviceSize(total_entries) * sizeof(ActiveBlockEntry));
+		}
+	}
+
 	return true;
+}
+
+void Decoder::Impl::build_static_edge_wg_lists()
+{
+	edge_wg_list_cpu.clear();
+	edge_wg_list_uploaded = false;
+	std::fill(std::begin(idwt_level_layouts), std::end(idwt_level_layouts), IdwtLevelLayout{});
+	if (!packed_2x2_wavelets)
+		return;
+
+	for (int level = 0; level < DecompositionLevels - 1; level++)
+	{
+		const int res_x = int(get_level_height(level));
+		const int res_y = int(get_level_width(level));
+		if (res_x < 34 || res_y < 34)
+			continue;
+
+		const int nx = (res_x + 15) / 16;
+		const int ny = (res_y + 15) / 16;
+		const int ix_end = std::min<int>(nx, (res_x - 18) / 16 + 1);
+		const int iy_end = std::min<int>(ny, (res_y - 18) / 16 + 1);
+		if (ix_end <= 1 || iy_end <= 1)
+			continue;
+
+		const int interior_wgs = (ix_end - 1) * (iy_end - 1);
+		// Only split large levels (L0 and L1 on 1080p/4K); small levels like L2 run faster as one direct dispatch.
+		if (interior_wgs < 1024)
+			continue;
+
+		auto &layout = idwt_level_layouts[level];
+		layout.use_split = true;
+		layout.ix_end = int32_t(ix_end);
+		layout.iy_end = int32_t(iy_end);
+		layout.edge_offset = uint32_t(edge_wg_list_cpu.size());
+
+		const int edge_total = nx * ny - interior_wgs;
+		edge_wg_list_cpu.resize(edge_wg_list_cpu.size() + size_t(edge_total));
+		uint32_t *edst = edge_wg_list_cpu.data() + layout.edge_offset;
+		for (int gy = 0; gy < ny; gy++)
+			*edst++ = uint32_t(gy) << 16; // gx = 0
+		for (int gx = ix_end; gx < nx; gx++)
+		{
+			const uint32_t gx_bits = uint32_t(gx);
+			for (int gy = 0; gy < ny; gy++)
+				*edst++ = gx_bits | (uint32_t(gy) << 16);
+		}
+		for (int gx = 1; gx < ix_end; gx++)
+			*edst++ = uint32_t(gx); // gy = 0
+		for (int gx = 1; gx < ix_end; gx++)
+		{
+			const uint32_t gx_bits = uint32_t(gx);
+			for (int gy = iy_end; gy < ny; gy++)
+				*edst++ = gx_bits | (uint32_t(gy) << 16);
+		}
+		layout.edge_count = uint32_t(edge_total);
+	}
 }
 
 bool Decoder::Impl::push_packet(const void *data_, size_t size)
 {
 	auto *data = static_cast<const uint8_t *>(data_);
+
+	const auto ensure_offset_table = [&]() -> uint32_t * {
+		if (uma_offset_write_ptr)
+			return uma_offset_write_ptr;
+		if (uma_offset_direct && uma_slot_submitted && !uma_offset_synced_to_cpu && uma_dequant_offset[uma_submitted_slot])
+		{
+			auto *prev = static_cast<const uint32_t *>(device->map_host_buffer(
+				*uma_dequant_offset[uma_submitted_slot], MEMORY_ACCESS_READ_BIT));
+			if (prev)
+			{
+				memcpy(dequant_offset_buffer_cpu.data(), prev, size_t(block_count_32x32) * sizeof(uint32_t));
+				device->unmap_host_buffer(*uma_dequant_offset[uma_submitted_slot], MEMORY_ACCESS_READ_BIT);
+			}
+			uma_offset_synced_to_cpu = true;
+		}
+		return dequant_offset_buffer_cpu.data();
+	};
+
+	uint32_t *offset_table = ensure_offset_table();
+
 	while (size >= sizeof(BitstreamHeader))
 	{
 		auto *header = reinterpret_cast<const BitstreamHeader *>(data);
@@ -187,6 +568,7 @@ bool Decoder::Impl::push_packet(const void *data_, size_t size)
 			{
 				clear();
 				last_seq = header->sequence;
+				offset_table = ensure_offset_table();
 			}
 
 			if (seq->code == BITSTREAM_EXTENDED_CODE_START_OF_FRAME)
@@ -212,7 +594,8 @@ bool Decoder::Impl::push_packet(const void *data_, size_t size)
 			continue;
 		}
 
-		size_t packet_size = header->payload_words * sizeof(uint32_t);
+		const uint32_t pwords = header->payload_words;
+		size_t packet_size = size_t(pwords) * sizeof(uint32_t);
 
 		if (packet_size > size)
 		{
@@ -240,6 +623,7 @@ bool Decoder::Impl::push_packet(const void *data_, size_t size)
 		{
 			clear();
 			last_seq = header->sequence;
+			offset_table = ensure_offset_table();
 		}
 
 		if (header->block_index >= uint32_t(block_count_32x32))
@@ -248,8 +632,43 @@ bool Decoder::Impl::push_packet(const void *data_, size_t size)
 			return false;
 		}
 
-		if (!decode_packet(header))
+		if (sizeof(*header) / sizeof(uint32_t) > pwords)
+		{
+			LOGE("payload_words is not large enough.\n");
 			return false;
+		}
+
+		auto &offset = offset_table[header->block_index];
+		if (offset == UINT32_MAX)
+		{
+			const uint32_t block_offset = uint32_t(uma_payload_written_words + payload_data_cpu.size());
+			decoded_blocks++;
+			offset = block_offset;
+			const uint8_t clb = block_to_comp_level_band[header->block_index];
+			const uint8_t comp = (clb >> 2) & 3u;
+			const uint8_t lvl = clb >> 4;
+			const uint8_t bnd = clb & 3u;
+			if (bnd != 0)
+			{
+				const uint32_t idx = active_hf_blocks[comp][lvl]++;
+				if (packed_2x2_wavelets && lvl < DecompositionLevels - 1)
+					active_block_list[comp][lvl][idx] = { block_dequant_coord[header->block_index], block_offset };
+			}
+
+			if (uma_payload_write_ptr &&
+			    !uma_slot_submitted &&
+			    payload_data_cpu.empty() &&
+			    uma_payload_written_words + pwords + 4 <= uma_payload_cap_words)
+			{
+				memcpy(uma_payload_write_ptr + uma_payload_written_words, data, packet_size);
+				uma_payload_written_words += pwords;
+			}
+			else
+			{
+				const auto *payload_words = reinterpret_cast<const uint32_t *>(data);
+				payload_data_cpu.insert(payload_data_cpu.end(), payload_words, payload_words + pwords);
+			}
+		}
 
 		data += packet_size;
 		size -= packet_size;
@@ -268,14 +687,109 @@ void Decoder::Impl::init_block_meta()
 {
 	WaveletBuffers::init_block_meta();
 
-	BufferCreateInfo info;
-	info.domain = BufferDomain::Device;
-	info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	// Enable UMA zero-copy ring-buffered uploads only on SSBO paths (STORAGE_MODE 0 or 3)
+	// so we never alias host-visible memory with linear 2D payload images.
+	use_uma_upload = !use_readonly_texel_buffer && select_uma_buffer_domain(*device, uma_domain);
+	uma_offset_direct = use_uma_upload && (uma_domain == BufferDomain::UMACachedCoherentPreferDevice);
 
+	BufferCreateInfo info;
 	info.size = block_count_32x32 * sizeof(uint32_t);
-	dequant_offset_buffer = device->create_buffer(info);
-	device->set_name(*dequant_offset_buffer, "meta-buffer");
+	if (use_uma_upload)
+	{
+		info.domain = uma_domain;
+		info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+		for (uint32_t i = 0; i < kUmaRingSlots; i++)
+		{
+			uma_dequant_offset[i] = device->create_buffer(info);
+			if (uma_dequant_offset[i])
+				device->set_name(*uma_dequant_offset[i], "meta-buffer-uma");
+		}
+		if (packed_2x2_wavelets)
+		{
+			BufferCreateInfo ab_info;
+			ab_info.size = std::max<VkDeviceSize>(64, VkDeviceSize(block_count_32x32) * 2 * sizeof(uint32_t));
+			ab_info.domain = uma_domain;
+			ab_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+			for (uint32_t i = 0; i < kUmaRingSlots; i++)
+			{
+				uma_active_blocks[i] = device->create_buffer(ab_info);
+				if (uma_active_blocks[i])
+					device->set_name(*uma_active_blocks[i], "active-blocks-uma");
+			}
+		}
+		LOGI("Using UMA zero-copy ring-buffered uploads.\n");
+	}
+	else
+	{
+		info.domain = BufferDomain::Device;
+		info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		dequant_offset_buffer = device->create_buffer(info);
+		device->set_name(*dequant_offset_buffer, "meta-buffer");
+		if (packed_2x2_wavelets)
+		{
+			BufferCreateInfo ab_info;
+			ab_info.size = std::max<VkDeviceSize>(64, VkDeviceSize(block_count_32x32) * 2 * sizeof(uint32_t));
+			ab_info.domain = BufferDomain::Device;
+			ab_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+			active_blocks_buffer = device->create_buffer(ab_info);
+			if (active_blocks_buffer)
+				device->set_name(*active_blocks_buffer, "active-blocks");
+		}
+	}
+
+	const auto &feats = device->get_device_features();
+	subgroup_ballot_mask =
+		feats.vk11_props.subgroupSize >= 12 &&
+		(!feats.vk13_features.subgroupSizeControl ||
+		 feats.vk13_props.minSubgroupSize >= 12 ||
+		 feats.driver_id == VK_DRIVER_ID_MOLTENVK ||
+		 device->get_gpu_properties().vendorID == 0x106Bu);
+
+	if (packed_2x2_wavelets)
+	{
+		build_static_edge_wg_lists();
+		if (!edge_wg_list_cpu.empty())
+		{
+			BufferCreateInfo wg_info;
+			wg_info.size = edge_wg_list_cpu.size() * sizeof(uint32_t);
+			wg_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+			wg_info.domain = BufferDomain::Device;
+			edge_wg_list_buffer = device->create_buffer(wg_info);
+			if (edge_wg_list_buffer)
+				device->set_name(*edge_wg_list_buffer, "idwt-edge-wg-list");
+		}
+	}
+
 	dequant_offset_buffer_cpu.resize(block_count_32x32);
+	block_to_comp_level_band.assign(block_count_32x32, 0);
+	block_dequant_coord.assign(block_count_32x32, 0);
+	for (int level = 0; level < DecompositionLevels; level++)
+	{
+		for (int component = 0; component < NumComponents; component++)
+		{
+			if (level == 0 && component != 0 && chroma == ChromaSubsampling::Chroma420)
+				continue;
+			int first_band = level == DecompositionLevels - 1 ? 0 : 1;
+			size_t total_level_blocks = 0;
+			for (int band = first_band; band < 4; band++)
+			{
+				const auto &m = block_meta[component][level][band];
+				total_level_blocks += size_t(m.block_count_32x32);
+				uint8_t clb = uint8_t((level << 4) | (component << 2) | band);
+				const int stride = std::max(1, m.block_stride_32x32);
+				for (int i = 0; i < m.block_count_32x32; i++)
+				{
+					block_to_comp_level_band[m.block_offset_32x32 + i] = clb;
+					const uint32_t bx = uint32_t(i % stride);
+					const uint32_t by = uint32_t(i / stride);
+					block_dequant_coord[m.block_offset_32x32 + i] =
+						(bx & 0xfffu) | ((by & 0xfffu) << 12) | (uint32_t(band) << 24);
+				}
+			}
+			if (packed_2x2_wavelets && level < DecompositionLevels - 1)
+				active_block_list[component][level].resize(total_level_blocks);
+		}
+	}
 
 	payload_data_cpu.reserve(1024 * 1024);
 }
@@ -284,7 +798,13 @@ bool Decoder::Impl::dequant(CommandBuffer &cmd)
 {
 	DequantizerPushData push = {};
 
-	cmd.set_specialization_constant_mask(0);
+	// Pascal benefits on sparse input, but this tradeoff did not help Tegra or RADV.
+	const auto &gpu = device->get_gpu_properties();
+	const bool direct_sign_prefix = gpu.vendorID == VENDOR_ID_NVIDIA &&
+		gpu.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+	cmd.set_specialization_constant_mask(direct_sign_prefix ? 1 : 0);
+	if (direct_sign_prefix)
+		cmd.set_specialization_constant(0, true);
 	cmd.enable_subgroup_size_control(true);
 
 	if (device->supports_subgroup_size_log2(true, 4, 7))
@@ -301,14 +821,26 @@ bool Decoder::Impl::dequant(CommandBuffer &cmd)
 		return false;
 	}
 
-	if (payload_r8_image && payload_r16_image && payload_r32_image)
-		cmd.set_program(shaders.wavelet_dequant[2]);
-	else if (use_readonly_texel_buffer)
-		cmd.set_program(shaders.wavelet_dequant[1]);
-	else
-		cmd.set_program(shaders.wavelet_dequant[0]);
+	const Buffer *active_dequant_offset = use_uma_upload ? uma_dequant_offset[uma_slot].get() : dequant_offset_buffer.get();
+	const Buffer *active_payload_data = use_uma_upload ? uma_payload_data[uma_slot].get() : payload_data.get();
+	if (!active_dequant_offset)
+		return false;
+	if (!payload_r8_image && !use_readonly_texel_buffer && !active_payload_data)
+		return false;
 
-	cmd.begin_region("DWT dequant");
+	int storage_mode;
+	if (payload_r8_image && payload_r16_image && payload_r32_image)
+		storage_mode = 2;
+	else if (use_readonly_texel_buffer)
+		storage_mode = 1;
+	else if (use_ssbo32_payload)
+		storage_mode = 3;
+	else
+		storage_mode = 0;
+
+	const bool debug_labels = device->get_device_features().supports_debug_utils;
+	if (debug_labels)
+		cmd.begin_region("DWT dequant");
 	auto start_dequant = cmd.write_timestamp(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
 	cmd.image_barrier(*wavelet_img_high_res, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
@@ -324,50 +856,83 @@ bool Decoder::Impl::dequant(CommandBuffer &cmd)
 		                  VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
 	}
 
+	if (wavelet_img_coarsest)
+	{
+		cmd.image_barrier(*wavelet_img_coarsest, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+		                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+		                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		                  VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+	}
+
 	// De-quantize
 	for (int level = 0; level < DecompositionLevels; level++)
 	{
+		const bool is_packed = level_is_packed_2x2(level);
+		cmd.set_program(shaders.wavelet_dequant[storage_mode][is_packed ? 1 : 0]);
 		for (int component = 0; component < NumComponents; component++)
 		{
 			// Ignore top-level CbCr when doing 420 subsampling.
 			if (level == 0 && component != 0 && chroma == ChromaSubsampling::Chroma420)
 				continue;
 
-			char label[128];
-			snprintf(label, sizeof(label), "level %d - component %d", level, component);
-			cmd.begin_region(label);
+			// Packed levels never zero empty blocks in dequant (iDWT skips empty blocks via payload_offsets);
+			// levels with zero active HF blocks need no dequant dispatch at all.
+			const uint32_t act_hf = active_hf_blocks[component][level];
+			if (is_packed && act_hf == 0)
+				continue;
 
-			for (int band = (level == DecompositionLevels - 1 ? 0 : 1); band < 4; band++)
+			if (debug_labels)
 			{
-				push.resolution.x = wavelet_img_high_res->get_width(level);
-				push.resolution.y = wavelet_img_high_res->get_height(level);
-				push.output_layer = band;
-				push.block_offset_32x32 = block_meta[component][level][band].block_offset_32x32;
-				push.block_stride_32x32 = block_meta[component][level][band].block_stride_32x32;
-				cmd.push_constants(&push, 0, sizeof(push));
-
-				cmd.set_storage_texture(0, 0, *component_layer_views[component][level]);
-				cmd.set_storage_buffer(0, 1, *dequant_offset_buffer);
-
-				if (payload_r8_image && payload_r16_image && payload_r32_image)
-				{
-					cmd.set_texture(0, 2, payload_r32_image->get_view());
-					cmd.set_texture(0, 3, payload_r16_image->get_view());
-					cmd.set_texture(0, 4, payload_r8_image->get_view());
-				}
-				else if (use_readonly_texel_buffer)
-				{
-					cmd.set_buffer_view(0, 2, *payload_u32_view);
-					cmd.set_buffer_view(0, 3, *payload_u16_view);
-					cmd.set_buffer_view(0, 4, *payload_u8_view);
-				}
-				else
-					cmd.set_storage_buffer(0, 2, *payload_data);
-
-				cmd.dispatch((push.resolution.x + 31) / 32, (push.resolution.y + 31) / 32, 1);
+				char label[128];
+				snprintf(label, sizeof(label), "level %d - component %d", level, component);
+				cmd.begin_region(label);
 			}
 
-			cmd.end_region();
+			int first_band = level == DecompositionLevels - 1 ? 0 : 1;
+			push.resolution.x = int32_t(get_level_width(level));
+			push.resolution.y = int32_t(get_level_height(level));
+			push.output_layer = first_band;
+			push.block_offset_32x32 = is_packed ? int32_t(active_block_offset[component][level])
+			                                    : block_meta[component][level][first_band].block_offset_32x32;
+			push.block_stride_32x32 = block_meta[component][level][first_band].block_stride_32x32;
+			push.band_stride_32x32 = block_meta[component][level][first_band].block_count_32x32;
+			cmd.push_constants(&push, 0, sizeof(push));
+
+			cmd.set_storage_texture(0, 0, *component_layer_views[component][level]);
+			if (is_packed)
+			{
+				const Buffer *active_blocks_buf = use_uma_upload ? uma_active_blocks[uma_slot].get() : active_blocks_buffer.get();
+				if (!active_blocks_buf)
+					return false;
+				cmd.set_storage_buffer(0, 1, *active_blocks_buf);
+			}
+			else
+			{
+				cmd.set_storage_buffer(0, 1, *active_dequant_offset);
+			}
+
+			if (payload_r8_image && payload_r16_image && payload_r32_image)
+			{
+				cmd.set_texture(0, 2, payload_r32_image->get_view());
+				cmd.set_texture(0, 3, payload_r16_image->get_view());
+				cmd.set_texture(0, 4, payload_r8_image->get_view());
+			}
+			else if (use_readonly_texel_buffer)
+			{
+				cmd.set_buffer_view(0, 2, *payload_u32_view);
+				cmd.set_buffer_view(0, 3, *payload_u16_view);
+				cmd.set_buffer_view(0, 4, *payload_u8_view);
+			}
+			else
+				cmd.set_storage_buffer(0, 2, *active_payload_data);
+
+			if (is_packed)
+				cmd.dispatch(act_hf, 1, 1);
+			else
+				cmd.dispatch((push.resolution.x + 31) / 32, (push.resolution.y + 31) / 32, 4 - first_band);
+
+			if (debug_labels)
+				cmd.end_region();
 		}
 	}
 
@@ -376,7 +941,9 @@ bool Decoder::Impl::dequant(CommandBuffer &cmd)
 	            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
 
 	auto end_dequant = cmd.write_timestamp(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-	cmd.end_region();
+	if (debug_labels)
+		cmd.end_region();
+	cmd.set_specialization_constant_mask(0);
 	cmd.enable_subgroup_size_control(false);
 	device->register_time_interval("GPU", std::move(start_dequant), std::move(end_dequant), "Dequant");
 
@@ -701,7 +1268,11 @@ bool Decoder::Impl::idwt_fragment(CommandBuffer &cmd, const ViewBuffers &views)
 
 bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 {
-	cmd.set_program(shaders.idwt[Configuration::get().get_precision()]);
+	const int prec = Configuration::get().get_precision();
+	const Buffer *active_dequant_offset = use_uma_upload ? uma_dequant_offset[uma_slot].get() : dequant_offset_buffer.get();
+	if (packed_2x2_wavelets && !active_dequant_offset)
+		return false;
+
 	cmd.enable_subgroup_size_control(false);
 
 	auto start_idwt = cmd.write_timestamp(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
@@ -710,72 +1281,222 @@ bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 	{
 		ivec2 resolution;
 		vec2 inv_resolution;
+		int32_t block_offset_32x32;
+		int32_t block_stride_32x32;
+		int32_t band_stride_32x32;
+		int32_t wg_offset_x;
+		int32_t wg_offset_y;
 	} push = {};
+
+	// Prewarm the small fixed set of packed iDWT pipelines once so scene changes never trigger
+	// mid-stream shader compilation stalls on the decode thread.
+	if (packed_2x2_wavelets)
+	{
+		const auto prewarm_one = [&](Program *prog, bool final_out, float rscale,
+		                             bool edge_pass, uint32_t band_mask, bool indirect_list,
+		                             bool mask_check, bool dynamic_ll) {
+			if (!prog)
+				return;
+			cmd.set_program(prog);
+			const uint32_t smask = (final_out ? 0x3u : 0x0u) | 0xfcu;
+			cmd.set_specialization_constant_mask(smask);
+			if (final_out)
+			{
+				cmd.set_specialization_constant(0, true);
+				cmd.set_specialization_constant(1, rscale);
+			}
+			cmd.set_specialization_constant(2, edge_pass);
+			cmd.set_specialization_constant(3, band_mask);
+			cmd.set_specialization_constant(4, indirect_list);
+			cmd.set_specialization_constant(5, mask_check);
+			cmd.set_specialization_constant(6, subgroup_ballot_mask);
+			cmd.set_specialization_constant(7, dynamic_ll);
+			DeferredPipelineCompile compile = {};
+			cmd.extract_pipeline_state(compile);
+			if (!prog->get_pipeline(compile.hash).pipeline)
+				CommandBuffer::build_compute_pipeline(device, compile, CommandBuffer::CompileMode::Sync);
+		};
+
+		const auto prewarm_level = [&](bool final_out, bool split) {
+			Program *p = shaders.idwt[prec][1][final_out ? 0 : 1];
+			const float scale = final_out ? views.range_scale : 1.0f;
+			for (int variant = 0; variant < 4; variant++)
+			{
+				const uint32_t bands = variant == 0 ? 0u : 7u;
+				const bool mask_check = variant >= 2;
+				const bool dynamic_ll = variant == 3;
+				if (split)
+					prewarm_one(p, final_out, scale, false, bands, false, mask_check, dynamic_ll);
+				prewarm_one(p, final_out, scale, true, bands, split, mask_check, dynamic_ll);
+			}
+		};
+
+		if (!prewarmed_idwt_intermediate)
+		{
+			bool split = false, direct = false;
+			for (int level = 1; level < DecompositionLevels - 1; level++)
+			{
+				split |= idwt_level_layouts[level].use_split;
+				direct |= !idwt_level_layouts[level].use_split;
+			}
+			if (split)
+				prewarm_level(false, true);
+			if (direct)
+				prewarm_level(false, false);
+			prewarmed_idwt_intermediate = true;
+		}
+		if (!prewarmed_idwt_final || prewarmed_range_scale != views.range_scale)
+		{
+			const bool luma_split = idwt_level_layouts[0].use_split;
+			prewarm_level(true, luma_split);
+			if (chroma == ChromaSubsampling::Chroma420 && idwt_level_layouts[1].use_split != luma_split)
+				prewarm_level(true, !luma_split);
+			prewarmed_idwt_final = true;
+			prewarmed_range_scale = views.range_scale;
+		}
+		cmd.set_specialization_constant_mask(0);
+	}
 
 	for (int input_level = DecompositionLevels - 1; input_level >= 0; input_level--)
 	{
+		const bool packed_in = level_is_packed_2x2(input_level);
 		// Transposed.
-		push.resolution.x = component_layer_views[0][input_level]->get_view_height();
-		push.resolution.y = component_layer_views[0][input_level]->get_view_width();
+		push.resolution.x = int32_t(get_level_height(input_level));
+		push.resolution.y = int32_t(get_level_width(input_level));
 		push.inv_resolution.x = 1.0f / float(push.resolution.x);
 		push.inv_resolution.y = 1.0f / float(push.resolution.y);
-		cmd.push_constants(&push, 0, sizeof(push));
-		cmd.set_specialization_constant_mask(3);
-		cmd.set_specialization_constant(0, false);
-		cmd.set_specialization_constant(1, 1.0f);
 
-		if (input_level == 0)
-		{
-			cmd.set_specialization_constant(0, true);
-			cmd.set_specialization_constant(1, views.range_scale);
-			if (chroma == ChromaSubsampling::Chroma444)
+		const int nx = (push.resolution.x + 15) / 16;
+		const int ny = (push.resolution.y + 15) / 16;
+
+		const auto dispatch_component = [&](int c, bool final_output, const ImageView &dst_view) {
+			const bool packed_out = !final_output && level_is_packed_2x2(input_level - 1);
+			cmd.set_program(shaders.idwt[prec][packed_in ? 1 : 0][packed_out ? 1 : 0]);
+			cmd.set_storage_texture(0, 1, dst_view);
+
+			if (packed_in)
 			{
-				for (int c = 0; c < NumComponents; c++)
+				const auto &layout = idwt_level_layouts[input_level];
+				const auto &meta = block_meta[c][input_level][1];
+				push.block_offset_32x32 = meta.block_offset_32x32;
+				push.block_stride_32x32 = meta.block_stride_32x32;
+				push.band_stride_32x32 = meta.block_count_32x32;
+				cmd.set_texture(0, 0, *component_layer_views[c][input_level]);
+				cmd.set_storage_buffer(0, 2, *active_dequant_offset);
+				cmd.set_storage_buffer(0, 3, edge_wg_list_buffer ? *edge_wg_list_buffer : *active_dequant_offset);
+
+				uint32_t spec_mask = (final_output ? 0x3u : 0x0u) | 0xfcu;
+				cmd.set_specialization_constant_mask(spec_mask);
+				if (final_output)
 				{
-					char label[64];
-					snprintf(label, sizeof(label), "iDWT final, component %u", c);
-					cmd.begin_region(label);
-					cmd.set_storage_texture(0, 1, *views.planes[c]);
-					cmd.set_texture(0, 0, *component_layer_views[c][input_level], *mirror_repeat_sampler);
-					cmd.dispatch((push.resolution.x + 15) / 16, (push.resolution.y + 15) / 16, 1);
-					cmd.end_region();
+					cmd.set_specialization_constant(0, true);
+					cmd.set_specialization_constant(1, views.range_scale);
+				}
+				const uint32_t act_hf = active_hf_blocks[c][input_level];
+				const uint32_t total_hf = 3u * uint32_t(meta.block_count_32x32);
+				const bool ll_only = act_hf == 0;
+				const bool mask_check = act_hf > 0 && act_hf < total_hf;
+				const bool dynamic_ll = mask_check && (act_hf * 3u < total_hf);
+				cmd.set_specialization_constant(3, ll_only ? 0u : 7u);
+				cmd.set_specialization_constant(5, mask_check);
+				cmd.set_specialization_constant(6, subgroup_ballot_mask);
+				cmd.set_specialization_constant(7, dynamic_ll);
+
+				if (layout.use_split)
+				{
+					cmd.set_specialization_constant(2, false);
+					cmd.set_specialization_constant(4, false);
+					push.wg_offset_x = 1;
+					push.wg_offset_y = 1;
+					cmd.push_constants(&push, 0, sizeof(push));
+					cmd.dispatch(uint32_t(layout.ix_end - 1), uint32_t(layout.iy_end - 1), 1);
+
+					if (layout.edge_count > 0)
+					{
+						cmd.set_specialization_constant(2, true);
+						cmd.set_specialization_constant(4, true);
+						push.wg_offset_x = int32_t(layout.edge_offset);
+						push.wg_offset_y = 0;
+						cmd.push_constants(&push, 0, sizeof(push));
+						cmd.dispatch(layout.edge_count, 1, 1);
+					}
+				}
+				else
+				{
+					cmd.set_specialization_constant(2, true);
+					cmd.set_specialization_constant(4, false);
+					push.wg_offset_x = 0;
+					push.wg_offset_y = 0;
+					cmd.push_constants(&push, 0, sizeof(push));
+					cmd.dispatch(nx, ny, 1);
 				}
 			}
 			else
 			{
-				cmd.set_storage_texture(0, 1, *views.planes[0]);
-				cmd.begin_region("iDWT final");
-				cmd.set_texture(0, 0, *component_layer_views[0][input_level], *mirror_repeat_sampler);
-				cmd.dispatch((push.resolution.x + 15) / 16, (push.resolution.y + 15) / 16, 1);
-				cmd.end_region();
+				cmd.set_specialization_constant_mask(final_output ? 3 : 0);
+				if (final_output)
+				{
+					cmd.set_specialization_constant(0, true);
+					cmd.set_specialization_constant(1, views.range_scale);
+				}
+				cmd.push_constants(&push, 0, 16);
+				cmd.set_texture(0, 0, *component_layer_views[c][input_level], *mirror_repeat_sampler);
+				cmd.dispatch(nx, ny, 1);
+			}
+		};
+
+		const bool debug_labels = device->get_device_features().supports_debug_utils;
+		if (input_level == 0)
+		{
+			if (chroma == ChromaSubsampling::Chroma444)
+			{
+				for (int c = 0; c < NumComponents; c++)
+				{
+					if (debug_labels)
+					{
+						char label[64];
+						snprintf(label, sizeof(label), "iDWT final, component %u", c);
+						cmd.begin_region(label);
+					}
+					dispatch_component(c, true, *views.planes[c]);
+					if (debug_labels)
+						cmd.end_region();
+				}
+			}
+			else
+			{
+				if (debug_labels)
+					cmd.begin_region("iDWT final");
+				dispatch_component(0, true, *views.planes[0]);
+				if (debug_labels)
+					cmd.end_region();
 			}
 		}
 		else
 		{
 			for (int c = 0; c < NumComponents; c++)
 			{
-				cmd.set_texture(0, 0, *component_layer_views[c][input_level], *mirror_repeat_sampler);
+				const bool is_final_chroma = chroma == ChromaSubsampling::Chroma420 && c != 0 && input_level == 1;
+				const ImageView &dst = is_final_chroma ? *views.planes[c] : *component_ll_views[c][input_level - 1];
 
-				if (chroma == ChromaSubsampling::Chroma420 && c != 0 && input_level == 1)
+				if (debug_labels)
 				{
-					cmd.set_storage_texture(0, 1, *views.planes[c]);
-					cmd.set_specialization_constant(0, true);
-					cmd.set_specialization_constant(1, views.range_scale);
+					char label[64];
+					snprintf(label, sizeof(label), "iDWT level %u, component %u", input_level - 1, c);
+					cmd.begin_region(label);
 				}
-				else
-					cmd.set_storage_texture(0, 1, *component_ll_views[c][input_level - 1]);
-
-				char label[64];
-				snprintf(label, sizeof(label), "iDWT level %u, component %u", input_level - 1, c);
-				cmd.begin_region(label);
-				cmd.dispatch((push.resolution.x + 15) / 16, (push.resolution.y + 15) / 16, 1);
-				cmd.end_region();
+				dispatch_component(c, is_final_chroma, dst);
+				if (debug_labels)
+					cmd.end_region();
 			}
 		}
 
 		cmd.set_specialization_constant_mask(0);
-		cmd.barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-		            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+		// The next level samples this level's output. The final level writes the planes
+		// consumed by Moonlight, which synchronizes them when it submits the render.
+		if (input_level != 0)
+			cmd.barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+			            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
 	}
 
 	auto end_idwt = cmd.write_timestamp(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
@@ -795,9 +1516,10 @@ bool Decoder::Impl::has_pristine_bands(int bands, const uint32_t *active_block_m
 	// TODO: It's possible to improve this by sending the "active block mask"
 	// as sideband data from encoder if need be.
 
+	const uint32_t *offset_table = uma_offset_write_ptr ? uma_offset_write_ptr : dequant_offset_buffer_cpu.data();
 	const auto block_is_missing = [&](uint32_t block_index)
 	{
-		if (dequant_offset_buffer_cpu[block_index] != UINT32_MAX)
+		if (offset_table[block_index] != UINT32_MAX)
 			return false;
 
 		uint32_t word_index = block_index / 32;
@@ -869,27 +1591,74 @@ bool Decoder::Impl::decode_is_ready(bool allow_partial_frame) const
 
 bool Decoder::Impl::decode(CommandBuffer &cmd, const ViewBuffers &views)
 {
-	cmd.begin_region("Decode uploads");
+	if (packed_2x2_wavelets && edge_wg_list_buffer && !edge_wg_list_uploaded)
 	{
-		upload_payload(cmd);
-
-		memcpy(cmd.update_buffer(*dequant_offset_buffer, 0,
-		                         dequant_offset_buffer_cpu.size() * sizeof(dequant_offset_buffer_cpu.front())),
-		       dequant_offset_buffer_cpu.data(), dequant_offset_buffer_cpu.size() * sizeof(dequant_offset_buffer_cpu.front()));
-
+		VkDeviceSize wg_size = edge_wg_list_cpu.size() * sizeof(uint32_t);
+		memcpy(cmd.update_buffer(*edge_wg_list_buffer, 0, wg_size), edge_wg_list_cpu.data(), wg_size);
 		cmd.barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-		            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-		            use_readonly_texel_buffer ? VK_ACCESS_2_SHADER_SAMPLED_READ_BIT : VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+		            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+		edge_wg_list_uploaded = true;
 	}
-	cmd.end_region();
+
+	if (use_uma_upload)
+	{
+		if (!upload_payload_uma(cmd))
+			return false;
+	}
+	else
+	{
+		cmd.begin_region("Decode uploads");
+		{
+			upload_payload(cmd);
+
+			memcpy(cmd.update_buffer(*dequant_offset_buffer, 0,
+			                         dequant_offset_buffer_cpu.size() * sizeof(dequant_offset_buffer_cpu.front())),
+			       dequant_offset_buffer_cpu.data(), dequant_offset_buffer_cpu.size() * sizeof(dequant_offset_buffer_cpu.front()));
+
+			if (packed_2x2_wavelets && active_blocks_buffer)
+			{
+				uint32_t total_entries = 0;
+				for (int l = 0; l < DecompositionLevels - 1; l++)
+					for (int c = 0; c < NumComponents; c++)
+						total_entries += active_hf_blocks[c][l];
+
+				if (total_entries > 0)
+				{
+					auto *dst = static_cast<ActiveBlockEntry *>(cmd.update_buffer(*active_blocks_buffer, 0,
+					                                                              VkDeviceSize(total_entries) * sizeof(ActiveBlockEntry)));
+					uint32_t entry_offset = 0;
+					for (int l = 0; l < DecompositionLevels - 1; l++)
+					{
+						for (int c = 0; c < NumComponents; c++)
+						{
+							active_block_offset[c][l] = entry_offset;
+							const uint32_t count = active_hf_blocks[c][l];
+							if (count > 0)
+							{
+								memcpy(dst + entry_offset, active_block_list[c][l].data(), count * sizeof(ActiveBlockEntry));
+								entry_offset += count;
+							}
+						}
+					}
+				}
+			}
+
+			cmd.barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+			            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+			            VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+			            (use_readonly_texel_buffer ? VK_ACCESS_2_SHADER_SAMPLED_READ_BIT : 0));
+		}
+		cmd.end_region();
+	}
 
 	if (!dequant(cmd))
 		return false;
 
-	cmd.barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-
 	if (fragment_path)
 	{
+		if (!use_uma_upload)
+			cmd.barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+
 		if (!idwt_fragment(cmd, views))
 			return false;
 	}
@@ -897,6 +1666,9 @@ bool Decoder::Impl::decode(CommandBuffer &cmd, const ViewBuffers &views)
 	{
 		if (!idwt(cmd, views))
 			return false;
+
+		if (!use_uma_upload)
+			cmd.barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
 	}
 
 	decoded_frame_for_current_sequence = true;
@@ -905,7 +1677,14 @@ bool Decoder::Impl::decode(CommandBuffer &cmd, const ViewBuffers &views)
 
 void Decoder::Impl::clear()
 {
-	std::fill(dequant_offset_buffer_cpu.begin(), dequant_offset_buffer_cpu.end(), UINT32_MAX);
+	begin_uma_payload_write();
+	uma_offset_synced_to_cpu = false;
+	if (uma_offset_write_ptr)
+		memset(uma_offset_write_ptr, 0xff, size_t(block_count_32x32) * sizeof(uint32_t));
+	else
+		memset(dequant_offset_buffer_cpu.data(), 0xff, dequant_offset_buffer_cpu.size() * sizeof(uint32_t));
+	memset(active_hf_blocks, 0, sizeof(active_hf_blocks));
+	memset(active_block_offset, 0, sizeof(active_block_offset));
 	decoded_blocks = 0;
 	last_seq = UINT32_MAX;
 	decoded_frame_for_current_sequence = false;
@@ -1019,14 +1798,15 @@ bool Decoder::init(Vulkan::Device *device, int width, int height, ChromaSubsampl
 		return false;
 	}
 
-	if (!impl->init(device, width, height, chroma_, fragment_path_))
+	if (!impl->init(device, width, height, chroma_, fragment_path_, !fragment_path_))
 	{
 		LOGE("Failed to initialize.\n");
 		return false;
 	}
 
 	if (!device->get_device_features().vk12_features.storageBuffer8BitAccess &&
-	    !impl->use_readonly_texel_buffer)
+	    !impl->use_readonly_texel_buffer &&
+	    !impl->use_ssbo32_payload)
 	{
 		LOGE("Device doesn't support 8-bit storage or large texel buffers.\n");
 		return false;
